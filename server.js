@@ -3,35 +3,26 @@ const cors = require('cors');
 const { Pool } = require('pg');
 const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
+const crypto = require('crypto');
 const multer = require('multer'); // Для загрузки фото
 const FormData = require('form-data');
 require('dotenv').config();
-const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const BIND_HOST = (process.env.BIND_HOST || '0.0.0.0').trim();
 
 // 👇 ВСТАВЬ СВОЮ ССЫЛКУ!
-const SERVER_URL = process.env.SERVER_URL || 'https://ytiiiipuff-production.up.railway.app';
+const SERVER_URL = 'https://loving-healing-production.up.railway.app'; 
+
 const WEBAPP_URL = process.env.WEBAPP_URL || process.env.MINI_APP_URL || process.env.FRONTEND_URL || process.env.CLIENT_URL || '';
 
-const corsOptions = {
-    origin: '*',
-    methods: ['GET','POST','PUT','DELETE','OPTIONS'],
-    allowedHeaders: ['Content-Type','X-Telegram-Init-Data','user-id']
-};
-app.use(cors(corsOptions));
-app.options('*', cors(corsOptions));
+app.use(cors({
+    origin: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'X-Telegram-Init-Data', 'user-id'],
+    maxAge: 86400
+}));
 app.use(express.json());
-
-// --- PROCESS DIAGNOSTICS (helps debug Railway SIGTERM / crashes) ---
-process.on('unhandledRejection', (reason) => {
-    console.error('❌ [unhandledRejection]', reason);
-});
-process.on('uncaughtException', (err) => {
-    console.error('❌ [uncaughtException]', err);
-});
 
 // Настройка Multer (храним фото в памяти перед отправкой в ТГ)
 const upload = multer({ storage: multer.memoryStorage() });
@@ -45,7 +36,8 @@ const pool = new Pool({
     ssl: { rejectUnauthorized: false }
 });
 
-const bot = new TelegramBot(process.env.BOT_TOKEN); // webhook mode (no polling)
+const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
+
 // --- БД ---
 const initDB = async () => {
     try {
@@ -191,8 +183,102 @@ CREATE TABLE IF NOT EXISTS cart_items (
 initDB();
 
 // --- УТИЛИТЫ ---
-const getAdmins = () => process.env.ADMIN_CHAT_ID.split(',').map(id => id.trim());
-const isAdmin = (telegramUserId) => getAdmins().includes(String(telegramUserId));
+const getAdmins = () => (process.env.ADMIN_CHAT_ID || '').split(',').map(id => id.trim()).filter(Boolean);
+
+
+// --- Telegram WebApp initData auth (HMAC SHA-256) ---
+const TG_INITDATA_MAX_AGE_SEC = parseInt(process.env.TG_INITDATA_MAX_AGE_SEC || '86400', 10); // 24h default
+
+const validateTelegramInitData = (initData) => {
+    const botToken = process.env.BOT_TOKEN;
+    if (!botToken) return { ok: false, reason: 'NO_BOT_TOKEN' };
+    if (!initData || typeof initData !== 'string') return { ok: false, reason: 'NO_INITDATA' };
+
+    let params;
+    try {
+        params = new URLSearchParams(initData);
+    } catch (e) {
+        return { ok: false, reason: 'BAD_INITDATA' };
+    }
+
+    const hash = params.get('hash');
+    if (!hash) return { ok: false, reason: 'NO_HASH' };
+    params.delete('hash');
+
+    // Optional: age check
+    const authDateStr = params.get('auth_date');
+    const authDate = authDateStr ? parseInt(authDateStr, 10) : null;
+    if (Number.isFinite(authDate) && Number.isFinite(TG_INITDATA_MAX_AGE_SEC) && TG_INITDATA_MAX_AGE_SEC > 0) {
+        const nowSec = Math.floor(Date.now() / 1000);
+        // reject too old or too far in the future
+        if ((nowSec - authDate) > TG_INITDATA_MAX_AGE_SEC || (authDate - nowSec) > 60) {
+            return { ok: false, reason: 'AUTH_DATE_EXPIRED' };
+        }
+    }
+
+    const dataCheckString = Array.from(params.entries())
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([k, v]) => `${k}=${v}`)
+        .join('\n');
+
+    // secret_key = HMAC_SHA256("WebAppData", bot_token)
+    const secretKey = crypto.createHmac('sha256', 'WebAppData').update(botToken).digest();
+    const computedHash = crypto.createHmac('sha256', secretKey).update(dataCheckString).digest('hex');
+
+    try {
+        const a = Buffer.from(computedHash, 'hex');
+        const b = Buffer.from(hash, 'hex');
+        if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+            return { ok: false, reason: 'HASH_MISMATCH' };
+        }
+    } catch (e) {
+        return { ok: false, reason: 'HASH_COMPARE_FAILED' };
+    }
+
+    const userStr = params.get('user');
+    if (!userStr) return { ok: false, reason: 'NO_USER' };
+
+    let user;
+    try {
+        user = JSON.parse(userStr);
+    } catch (e) {
+        return { ok: false, reason: 'BAD_USER_JSON' };
+    }
+    if (!user || !user.id) return { ok: false, reason: 'NO_USER_ID' };
+
+    return { ok: true, user };
+};
+
+const requireTelegramAuth = (req, res, next) => {
+    const initData = req.get('X-Telegram-Init-Data') || '';
+    const v = validateTelegramInitData(initData);
+    if (!v.ok) return res.status(401).json({ error: 'TG_AUTH_INVALID', reason: v.reason });
+
+    req.tgUserId = String(v.user.id);
+    req.tgUsername = v.user.username ? String(v.user.username) : null;
+    req.tgFirstName = v.user.first_name ? String(v.user.first_name) : null;
+    return next();
+};
+
+const requireAdmin = (req, res, next) => {
+    if (!isAdmin(req.tgUserId)) return res.status(403).json({ error: 'Access denied' });
+    return next();
+};
+
+const requireSelfOrAdminParam = (paramName) => (req, res, next) => {
+    const target = req.params[paramName];
+    if (isAdmin(req.tgUserId)) return next();
+    if (String(req.tgUserId) !== String(target)) return res.status(403).json({ error: 'Forbidden' });
+    return next();
+};
+
+// Apply Telegram auth to all API routes (except /api/image) and allow CORS preflight OPTIONS.
+app.use((req, res, next) => {
+    if (req.method === 'OPTIONS') return next();
+    if (!req.path.startsWith('/api')) return next();
+    if (req.path.startsWith('/api/image')) return next();
+    return requireTelegramAuth(req, res, next);
+});
 
 const normalizePromoCode = (code) => (code || '').toString().trim().toUpperCase();
 
@@ -218,121 +304,6 @@ const clampInt = (v, min, max) => {
     return Math.min(max, Math.max(min, n));
 };
 
-
-
-// --- TELEGRAM MINI APP AUTH (initData validation) ---
-// Validates Telegram.WebApp.initData via HMAC-SHA256 algorithm:
-// secret_key = HMAC_SHA256("WebAppData", bot_token)
-// hash = HMAC_SHA256(secret_key, data_check_string)
-// Docs: https://docs.telegram-mini-apps.com/platform/init-data and core.telegram.org/bots/webapps#validating-data-received-via-the-mini-app
-
-const parseInitData = (initDataRaw) => {
-    const s = (initDataRaw || '').toString().trim().replace(/^\?/, '');
-    const params = new URLSearchParams(s);
-    return params;
-};
-
-const buildDataCheckString = (params) => {
-    const pairs = [];
-    for (const [k, v] of params.entries()) {
-        if (k === 'hash' || k === 'signature') continue;
-        pairs.push(`${k}=${v}`);
-    }
-    // Sort alphabetically by whole "key=value" (equivalent to by key if keys unique)
-    pairs.sort();
-    return pairs.join('\n');
-};
-
-const timingSafeEqualHex = (aHex, bHex) => {
-    try {
-        const a = Buffer.from(String(aHex || '').toLowerCase(), 'hex');
-        const b = Buffer.from(String(bHex || '').toLowerCase(), 'hex');
-        if (a.length === 0 || b.length === 0 || a.length !== b.length) return false;
-        return crypto.timingSafeEqual(a, b);
-    } catch {
-        return false;
-    }
-};
-
-const validateTelegramInitData = (initDataRaw, botToken) => {
-    if (!initDataRaw || !botToken) return { ok: false, reason: 'missing_initdata_or_token' };
-    const params = parseInitData(initDataRaw);
-    const receivedHash = params.get('hash');
-    if (!receivedHash) return { ok: false, reason: 'missing_hash' };
-
-    const dataCheckString = buildDataCheckString(params);
-    const secretKey = crypto.createHmac('sha256', 'WebAppData').update(botToken).digest();
-    const computedHash = crypto.createHmac('sha256', secretKey).update(dataCheckString).digest('hex');
-
-    if (!timingSafeEqualHex(receivedHash, computedHash)) {
-        return { ok: false, reason: 'hash_mismatch' };
-    }
-
-    // Parse user payload (JSON string)
-    let user = null;
-    const userRaw = params.get('user');
-    if (userRaw) {
-        try { user = JSON.parse(userRaw); } catch { user = null; }
-    }
-    if (!user || !user.id) return { ok: false, reason: 'missing_user' };
-
-    return {
-        ok: true,
-        user: {
-            id: String(user.id),
-            username: (user.username || '').toString(),
-            first_name: (user.first_name || '').toString(),
-            last_name: (user.last_name || '').toString()
-        }
-    };
-};
-
-const requireTelegramAuth = (req, res, next) => {
-    const initData = req.get('X-Telegram-Init-Data') || req.headers['x-telegram-init-data'];
-    const v = validateTelegramInitData(initData, process.env.BOT_TOKEN);
-    if (!v.ok) return res.status(401).json({ error: 'INVALID_TELEGRAM_INIT_DATA', reason: v.reason });
-
-    req.tgUserId = v.user.id;
-    req.tgUsername = v.user.username ? v.user.username.trim().replace(/^@/, '') : '';
-    req.tgFirstName = v.user.first_name || '';
-    req.tgLastName = v.user.last_name || '';
-    req.tgIsAdmin = isAdmin(req.tgUserId);
-    next();
-};
-
-const requireAdmin = (req, res, next) => {
-    if (!req.tgIsAdmin) return res.status(403).json({ error: 'Access denied' });
-    next();
-};
-
-const requireOwnerOrAdmin = (getTargetId) => (req, res, next) => {
-    const target = String(getTargetId(req));
-    if (String(req.tgUserId) === target || req.tgIsAdmin) return next();
-    return res.status(403).json({ error: 'FORBIDDEN' });
-};
-
-const buildNicknameFromTelegram = (firstName, lastName, username) => {
-    const full = [firstName, lastName].map(s => (s || '').toString().trim()).filter(Boolean).join(' ').trim();
-    if (full) return full;
-    const u = (username || '').toString().trim().replace(/^@/, '');
-    if (u) return u;
-    return 'Пользователь';
-};
-
-const ensureUserRecord = async (telegramId, username, firstName, lastName) => {
-    const u = (username || '').toString().trim().replace(/^@/, '');
-    const nick = buildNicknameFromTelegram(firstName, lastName, u);
-    const result = await pool.query(
-        `INSERT INTO users (telegram_id, username, nickname)
-         VALUES ($1, $2, $3)
-         ON CONFLICT (telegram_id)
-         DO UPDATE SET username = EXCLUDED.username, nickname = EXCLUDED.nickname
-         RETURNING *`,
-        [telegramId, u, nick]
-    );
-    return result.rows[0];
-};
-
 // Бот теперь нужен только для /start и уведомлений
 bot.onText(/\/start/, (msg) => {
     const chatId = msg.chat.id;
@@ -356,68 +327,14 @@ bot.onText(/\/start/, (msg) => {
     }
 });
 
-// --- TELEGRAM WEBHOOK (instead of polling) ---
-// Railway/containers могут перезапускаться; webhook стабилен и не даёт 409 getUpdates конфликтов.
-// Опционально можно защитить вебхук secret-токеном:
-// - задай TG_WEBHOOK_SECRET (или TELEGRAM_WEBHOOK_SECRET)
-// - Telegram будет слать заголовок: x-telegram-bot-api-secret-token
-const TG_WEBHOOK_SECRET = (process.env.TG_WEBHOOK_SECRET || process.env.TELEGRAM_WEBHOOK_SECRET || '').trim();
-const TG_WEBHOOK_PATH = TG_WEBHOOK_SECRET ? `/telegram-webhook/${TG_WEBHOOK_SECRET}` : '/telegram-webhook';
-
-app.get(TG_WEBHOOK_PATH, (req, res) => res.status(200).send('ok'));
-
-app.post(TG_WEBHOOK_PATH, (req, res) => {
-    try {
-        if (TG_WEBHOOK_SECRET) {
-            const header = req.get('x-telegram-bot-api-secret-token') || '';
-            if (header !== TG_WEBHOOK_SECRET) return res.sendStatus(401);
-        }
-        if (req.body && typeof req.body.update_id !== 'undefined') {
-            console.log('⬇️ Telegram update_id:', req.body.update_id);
-        }
-        bot.processUpdate(req.body);
-        return res.sendStatus(200);
-    } catch (e) {
-        console.error('❌ Webhook processing error:', e);
-        return res.sendStatus(200);
-    }
-});
-
-const setupTelegramWebhook = async () => {
-    if (!process.env.BOT_TOKEN) return;
-    if (!SERVER_URL) {
-        console.error('❌ SERVER_URL is empty: cannot set Telegram webhook.');
-        return;
-    }
-    const webhookUrl = `${SERVER_URL}${TG_WEBHOOK_PATH}`;
-    try {
-        // Defensive: remove any existing webhook first (avoids weird states during redeploys)
-        await bot.deleteWebHook({ drop_pending_updates: true });
-
-        await bot.setWebHook(
-            webhookUrl,
-            TG_WEBHOOK_SECRET
-                ? { secret_token: TG_WEBHOOK_SECRET, drop_pending_updates: true }
-                : { drop_pending_updates: true }
-        );
-        console.log(`✅ Telegram webhook set: ${webhookUrl}`);
-
-        // Useful for debugging if Telegram can reach your endpoint
-        const info = await bot.getWebHookInfo();
-        console.log('ℹ️ Telegram getWebhookInfo:', info);
-    } catch (e) {
-        // node-telegram-bot-api иногда кладёт ответ в e.response.body
-        console.error('❌ Failed to set Telegram webhook:', e?.response?.body || e?.message || e);
-    }
-};
-
-
 // --- АДМИНКА ---
 
 // 1. Добавить товар (Одиночный)
-app.post('/api/admin/product', requireTelegramAuth, requireAdmin, upload.single('photo'), async (req, res) => {
+app.post('/api/admin/product', upload.single('photo'), async (req, res) => {
     try {
-        const { name, category, description, price, purchase_price, stock } = req.body;
+        const { userId, name, category, description, price, purchase_price, stock } = req.body;
+        if (!isAdmin(req.tgUserId)) return res.status(403).json({ error: 'Access denied' });
+
         let internalLink = null;
         if (req.file) {
             const storageChatId = getAdmins()[0]; 
@@ -437,10 +354,11 @@ app.post('/api/admin/product', requireTelegramAuth, requireAdmin, upload.single(
 });
 
 // 1.1 Массовый импорт (Batch)
-app.post('/api/admin/products/batch', requireTelegramAuth, requireAdmin, async (req, res) => {
+app.post('/api/admin/products/batch', async (req, res) => {
     try {
-        const { products } = req.body;
-
+        const { userId, products } = req.body;
+        if (!isAdmin(req.tgUserId)) return res.status(403).json({ error: 'Access denied' });
+        
         const client = await pool.connect();
         try {
             await client.query('BEGIN'); 
@@ -458,8 +376,10 @@ app.post('/api/admin/products/batch', requireTelegramAuth, requireAdmin, async (
 });
 
 // 1.2 БЫСТРОЕ ОБНОВЛЕНИЕ ФОТО (НОВОЕ)
-app.post('/api/admin/product/:id/image', requireTelegramAuth, requireAdmin, upload.single('photo'), async (req, res) => {
+app.post('/api/admin/product/:id/image', upload.single('photo'), async (req, res) => {
     try {
+        const userId = req.body.userId; // Multer parses body too
+        if (!isAdmin(req.tgUserId)) return res.status(403).json({ error: 'Access denied' });
         if (!req.file) return res.status(400).json({ error: 'No photo' });
 
         const storageChatId = getAdmins()[0]; 
@@ -474,8 +394,11 @@ app.post('/api/admin/product/:id/image', requireTelegramAuth, requireAdmin, uplo
 });
 
 // 2. Удалить товар (ИСПРАВЛЕНО: удаляет и из корзин тоже)
-app.delete('/api/admin/product/:id', requireTelegramAuth, requireAdmin, async (req, res) => {
+app.delete('/api/admin/product/:id', async (req, res) => {
     try {
+        const userId = req.headers['user-id']; 
+        if (!isAdmin(req.tgUserId)) return res.status(403).json({ error: 'Access denied' });
+
         const productId = req.params.id;
 
         // 1. Сначала удаляем этот товар из всех корзин пользователей
@@ -492,18 +415,20 @@ app.delete('/api/admin/product/:id', requireTelegramAuth, requireAdmin, async (r
 });
 
 // 2.1 Изменить сток
-app.post('/api/admin/product/stock', requireTelegramAuth, requireAdmin, async (req, res) => {
+app.post('/api/admin/product/stock', async (req, res) => {
     try {
-        const { productId, change } = req.body;
+        const { userId, productId, change } = req.body;
+        if (!isAdmin(req.tgUserId)) return res.status(403).json({ error: 'Access denied' });
         await pool.query('UPDATE products SET stock = stock + $1 WHERE id = $2', [parseInt(change), productId]);
         res.json({ success: true });
     } catch (err) { res.status(500).json({ error: 'Stock update error' }); }
 });
 
 // 3. Получить заказы
-app.get('/api/admin/orders', requireTelegramAuth, requireAdmin, async (req, res) => {
+app.get('/api/admin/orders', async (req, res) => {
     try {
-        const { status } = req.query;
+        const { userId, status } = req.query;
+        if (!isAdmin(req.tgUserId)) return res.status(403).json({ error: 'Access denied' });
         const result = await pool.query("SELECT * FROM orders WHERE status = $1 ORDER BY id DESC LIMIT 50", [status || 'active']);
         const orders = await Promise.all(result.rows.map(async (o) => {
             const u = await pool.query(
@@ -517,8 +442,10 @@ app.get('/api/admin/orders', requireTelegramAuth, requireAdmin, async (req, res)
 });
 
 // 4. Завершить заказ
-app.post('/api/admin/order/:id/done', requireTelegramAuth, requireAdmin, async (req, res) => {
+app.post('/api/admin/order/:id/done', async (req, res) => {
     try {
+        const { userId } = req.body;
+        if (!isAdmin(req.tgUserId)) return res.status(403).json({ error: 'Access denied' });
         const orderRes = await pool.query("SELECT * FROM orders WHERE id = $1 AND status = 'active'", [req.params.id]);
         if (orderRes.rows.length === 0) return res.status(404).json({ error: 'Order not found' });
         const orderRow = orderRes.rows[0];
@@ -533,9 +460,10 @@ app.post('/api/admin/order/:id/done', requireTelegramAuth, requireAdmin, async (
 });
 
 // 5. Редактировать заказ
-app.put('/api/admin/order/:id', requireTelegramAuth, requireAdmin, async (req, res) => {
+app.put('/api/admin/order/:id', async (req, res) => {
     try {
-        const { address, comment, details, total_price } = req.body;
+        const { userId, address, comment, details, total_price } = req.body;
+        if (!isAdmin(req.tgUserId)) return res.status(403).json({ error: 'Access denied' });
         await pool.query(
             "UPDATE orders SET address = $1, comment = $2, details = $3, total_price = $4 WHERE id = $5",
             [address, comment, JSON.stringify(details), total_price, req.params.id]
@@ -545,8 +473,10 @@ app.put('/api/admin/order/:id', requireTelegramAuth, requireAdmin, async (req, r
 });
 
 // 6. Статистика
-app.get('/api/admin/stats', requireTelegramAuth, requireAdmin, async (req, res) => {
+app.get('/api/admin/stats', async (req, res) => {
     try {
+        const userId = req.query.userId;
+        if (!isAdmin(req.tgUserId)) return res.status(403).json({ error: 'Access denied' });
         const now = new Date();
         const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
         const endOfMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59);
@@ -568,9 +498,10 @@ app.get('/api/admin/stats', requireTelegramAuth, requireAdmin, async (req, res) 
     } catch (err) { res.status(500).json({ error: 'Stats error' }); }
 });
 
-app.post('/api/admin/expense', requireTelegramAuth, requireAdmin, async (req, res) => {
+app.post('/api/admin/expense', async (req, res) => {
     try {
-        const { amount, comment } = req.body;
+        const { userId, amount, comment } = req.body;
+        if (!isAdmin(req.tgUserId)) return res.status(403).json({ error: 'Access denied' });
         await pool.query('INSERT INTO expenses (amount, comment) VALUES ($1, $2)', [amount, comment]);
         res.json({ success: true });
     } catch (err) { res.status(500).json({ success: false }); }
@@ -579,16 +510,19 @@ app.post('/api/admin/expense', requireTelegramAuth, requireAdmin, async (req, re
 // 7. VISUAL DB MANAGER
 const isValidTable = (t) => ['users', 'products', 'expenses', 'faq', 'orders', 'cart_items', 'promo_codes'].includes(t);
 
-app.get('/api/admin/db/:table', requireTelegramAuth, requireAdmin, async (req, res) => {
+app.get('/api/admin/db/:table', async (req, res) => {
     try {
+        if (!isAdmin(req.tgUserId)) return res.status(403).json({ error: 'Denied' });
         if (!isValidTable(req.params.table)) return res.status(400).json({ error: 'Invalid table' });
         const result = await pool.query(`SELECT * FROM ${req.params.table} ORDER BY id DESC LIMIT 100`);
         res.json(result.rows);
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post('/api/admin/db/:table', requireTelegramAuth, requireAdmin, async (req, res) => {
+app.post('/api/admin/db/:table', async (req, res) => {
     try {
+        const userId = req.headers['user-id'];
+        if (!isAdmin(req.tgUserId)) return res.status(403).json({ error: 'Denied' });
         if (!isValidTable(req.params.table)) return res.status(400).json({ error: 'Invalid table' });
         const data = req.body;
         const keys = Object.keys(data);
@@ -599,8 +533,10 @@ app.post('/api/admin/db/:table', requireTelegramAuth, requireAdmin, async (req, 
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.put('/api/admin/db/:table/:id', requireTelegramAuth, requireAdmin, async (req, res) => {
+app.put('/api/admin/db/:table/:id', async (req, res) => {
     try {
+        const userId = req.headers['user-id'];
+        if (!isAdmin(req.tgUserId)) return res.status(403).json({ error: 'Denied' });
         if (!isValidTable(req.params.table)) return res.status(400).json({ error: 'Invalid table' });
         const data = req.body;
         const keys = Object.keys(data);
@@ -611,8 +547,10 @@ app.put('/api/admin/db/:table/:id', requireTelegramAuth, requireAdmin, async (re
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.delete('/api/admin/db/:table/:id', requireTelegramAuth, requireAdmin, async (req, res) => {
+app.delete('/api/admin/db/:table/:id', async (req, res) => {
     try {
+        const userId = req.headers['user-id'];
+        if (!isAdmin(req.tgUserId)) return res.status(403).json({ error: 'Denied' });
         if (!isValidTable(req.params.table)) return res.status(400).json({ error: 'Invalid table' });
         await pool.query(`DELETE FROM ${req.params.table} WHERE id = $1`, [req.params.id]);
         res.json({ success: true });
@@ -620,16 +558,19 @@ app.delete('/api/admin/db/:table/:id', requireTelegramAuth, requireAdmin, async 
 });
 
 // --- PROMO CODES (ADMIN) ---
-app.get('/api/admin/promos', requireTelegramAuth, requireAdmin, async (req, res) => {
+app.get('/api/admin/promos', async (req, res) => {
     try {
+        const { userId } = req.query;
+        if (!isAdmin(req.tgUserId)) return res.status(403).json({ error: 'Access denied' });
         const result = await pool.query('SELECT * FROM promo_codes ORDER BY id DESC');
         res.json(result.rows);
     } catch (e) { res.status(500).json({ error: 'Promos error' }); }
 });
 
-app.post('/api/admin/promos', requireTelegramAuth, requireAdmin, async (req, res) => {
+app.post('/api/admin/promos', async (req, res) => {
     try {
-        const { code, discount_percent } = req.body;
+        const { userId, code, discount_percent } = req.body;
+        if (!isAdmin(req.tgUserId)) return res.status(403).json({ error: 'Access denied' });
         const promoCode = normalizePromoCode(code);
         const pct = clampInt(discount_percent, 1, 100);
         if (!promoCode) return res.status(400).json({ error: 'Empty code' });
@@ -641,9 +582,10 @@ app.post('/api/admin/promos', requireTelegramAuth, requireAdmin, async (req, res
     } catch (e) { res.status(500).json({ error: 'Create promo error' }); }
 });
 
-app.put('/api/admin/promos/:id', requireTelegramAuth, requireAdmin, async (req, res) => {
+app.put('/api/admin/promos/:id', async (req, res) => {
     try {
-        const { discount_percent, is_active } = req.body;
+        const { userId, discount_percent, is_active } = req.body;
+        if (!isAdmin(req.tgUserId)) return res.status(403).json({ error: 'Access denied' });
         const pct = discount_percent !== undefined ? clampInt(discount_percent, 1, 100) : null;
         const active = (is_active === undefined) ? null : !!is_active;
 
@@ -659,8 +601,10 @@ app.put('/api/admin/promos/:id', requireTelegramAuth, requireAdmin, async (req, 
     } catch (e) { res.status(500).json({ error: 'Update promo error' }); }
 });
 
-app.delete('/api/admin/promos/:id', requireTelegramAuth, requireAdmin, async (req, res) => {
+app.delete('/api/admin/promos/:id', async (req, res) => {
     try {
+        const userId = req.headers['user-id'];
+        if (!isAdmin(req.tgUserId)) return res.status(403).json({ error: 'Access denied' });
         await pool.query('DELETE FROM promo_codes WHERE id = $1', [req.params.id]);
         res.json({ success: true });
     } catch (e) { res.status(500).json({ error: 'Delete promo error' }); }
@@ -677,16 +621,22 @@ app.get('/api/image/:fileId', async (req, res) => {
     } catch (e) { res.status(404).send('Not found'); }
 });
 
-app.get('/api/user/me', requireTelegramAuth, async (req, res) => {
+app.get('/api/me', async (req, res) => {
     try {
-        const user = await ensureUserRecord(req.tgUserId, req.tgUsername, req.tgFirstName, req.tgLastName);
-        user.is_admin = req.tgIsAdmin;
-        res.json(user);
-    } catch (err) { res.status(500).json({ error: err.message }); }
+        const result = await pool.query('SELECT * FROM users WHERE telegram_id = $1', [req.tgUserId]);
+        if (result.rows.length > 0) {
+            const user = result.rows[0];
+            user.is_admin = isAdmin(user.telegram_id);
+            res.json(user);
+        } else {
+            res.status(404).json({ message: 'User not found' });
+        }
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
-// Get user's own order history (for profile) - safe shortcut
-app.get('/api/user/me/orders', requireTelegramAuth, async (req, res) => {
+app.get('/api/me/orders', async (req, res) => {
     try {
         const userId = req.tgUserId;
         const result = await pool.query(
@@ -698,11 +648,12 @@ app.get('/api/user/me/orders', requireTelegramAuth, async (req, res) => {
             items: (() => { try { return JSON.parse(r.details); } catch { return []; } })()
         }));
         res.json(rows);
-    } catch (e) { res.status(500).json({ error: 'Orders history error' }); }
+    } catch (e) {
+        res.status(500).json({ error: 'Orders history error' });
+    }
 });
 
-// Get authenticated user's cart (safe shortcut)
-app.get('/api/cart', requireTelegramAuth, async (req, res) => {
+app.get('/api/me/cart', async (req, res) => {
     try {
         const result = await pool.query(
             `SELECT c.product_id, c.quantity, p.name, p.price, p.image_url
@@ -713,19 +664,21 @@ app.get('/api/cart', requireTelegramAuth, async (req, res) => {
             [req.tgUserId]
         );
         res.json(result.rows);
-    } catch (err) { res.status(500).json({ error: 'Cart error' }); }
+    } catch (err) {
+        res.status(500).json({ error: 'Cart error' });
+    }
 });
 
-app.get('/api/user/:id', requireTelegramAuth, requireOwnerOrAdmin(req => req.params.id), async (req, res) => {
+app.get('/api/user/:id', requireSelfOrAdminParam('id'), async (req, res) => {
     try {
         const result = await pool.query('SELECT * FROM users WHERE telegram_id = $1', [req.params.id]);
-        if (result.rows.length > 0) { const user = result.rows[0]; user.is_admin = req.tgIsAdmin; res.json(user); } 
+        if (result.rows.length > 0) { const user = result.rows[0]; user.is_admin = isAdmin(req.params.id); res.json(user); } 
         else res.status(404).json({ message: 'User not found' });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // Get user's own order history (for profile)
-app.get('/api/user/:id/orders', requireTelegramAuth, requireOwnerOrAdmin(req => req.params.id), async (req, res) => {
+app.get('/api/user/:id/orders', requireSelfOrAdminParam('id'), async (req, res) => {
     try {
         const userId = req.params.id;
         const result = await pool.query(
@@ -752,29 +705,30 @@ app.post('/api/promo/validate', async (req, res) => {
         res.json({ valid: true, code: row.code, discount_percent: row.discount_percent });
     } catch (e) { res.status(500).json({ valid: false, message: 'Ошибка сервера' }); }
 });
-app.post('/api/register', requireTelegramAuth, async (req, res) => {
+app.post('/api/register', async (req, res) => {
     try {
-        const user = await ensureUserRecord(req.tgUserId, req.tgUsername, req.tgFirstName, req.tgLastName);
-        user.is_admin = req.tgIsAdmin;
+        const { userId, username, nickname } = (req.body || {});
+        if (!userId) return res.status(400).json({ success: false, message: 'Missing userId' });
+
+        const u = (username || '').toString().trim().replace(/^@/, '');
+        const n = (nickname || '').toString().trim();
+
+        const result = await pool.query(
+	            `INSERT INTO users (telegram_id, username, nickname)
+	             VALUES ($1, $2, $3)
+             ON CONFLICT (telegram_id)
+             DO UPDATE SET username = EXCLUDED.username, nickname = EXCLUDED.nickname
+             RETURNING *`,
+	            [userId, u, n]
+        );
+
+        const user = result.rows[0];
+        user.is_admin = isAdmin(userId);
         res.json({ success: true, user });
     } catch (err) { console.error(err); res.status(500).json({ success: false }); }
 });
 app.get('/api/products', async (req, res) => {
-    try {
-        const result = await pool.query(
-            'SELECT id, name, category, description, brand, price, image_url, stock, created_at FROM products ORDER BY id DESC'
-        );
-        res.json(result.rows);
-    } catch (err) { res.status(500).json({ error: err.message }); }
-
-// Admin-only products (includes purchase_price)
-app.get('/api/admin/products', requireTelegramAuth, requireAdmin, async (req, res) => {
-    try {
-        const result = await pool.query('SELECT * FROM products ORDER BY id DESC');
-        res.json(result.rows);
-    } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
+    try { const result = await pool.query('SELECT * FROM products ORDER BY id DESC'); res.json(result.rows); } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // Reviews channel link (stored in settings.reviews_channel_url)
@@ -790,19 +744,19 @@ app.get('/api/reviews-channel', async (req, res) => {
 app.get('/api/faq', async (req, res) => {
     try { const result = await pool.query('SELECT * FROM faq ORDER BY id ASC'); res.json(result.rows); } catch (err) { res.status(500).json({ error: err.message }); }
 });
-app.get('/api/cart/:userId', requireTelegramAuth, requireOwnerOrAdmin(req => req.params.userId), async (req, res) => {
+app.get('/api/cart/:userId', requireSelfOrAdminParam('userId'), async (req, res) => {
     try {
         const result = await pool.query(`SELECT c.product_id, c.quantity, p.name, p.price, p.image_url FROM cart_items c JOIN products p ON c.product_id = p.id WHERE c.user_telegram_id = $1 ORDER BY p.name ASC`, [req.params.userId]);
         res.json(result.rows);
     } catch (err) { res.status(500).json({ error: 'Cart error' }); }
 });
-app.post('/api/cart/add', requireTelegramAuth, async (req, res) => {
+app.post('/api/cart/add', async (req, res) => {
     try {
-        const userId = req.tgUserId;
-        const { productId } = (req.body || {});
-        if (!userId || !productId) return res.status(400).json({ success: false, error: 'BAD_REQUEST' });
-
-        // Enforce stock limit (cannot add more than available in DB)
+        const { userId: bodyUserId, productId } = (req.body || {});
+        const userId = String(req.tgUserId);
+        if (bodyUserId && !isAdmin(req.tgUserId) && String(bodyUserId) !== userId) return res.status(403).json({ success: false, error: 'FORBIDDEN' });
+        if (!productId) return res.status(400).json({ success: false, error: 'BAD_REQUEST' });
+// Enforce stock limit (cannot add more than available in DB)
         const prodRes = await pool.query('SELECT stock FROM products WHERE id = $1', [productId]);
         const stock = prodRes.rows.length ? (parseInt(prodRes.rows[0].stock, 10) || 0) : 0;
         if (stock <= 0) {
@@ -826,9 +780,12 @@ app.post('/api/cart/add', requireTelegramAuth, async (req, res) => {
 });
 
 // Update product fields (admin only) — currently used for editing category in admin products tab
-app.put('/api/admin/product/:id', requireTelegramAuth, requireAdmin, async (req, res) => {
+app.put('/api/admin/product/:id', async (req, res) => {
     try {
         const id = parseInt(req.params.id, 10);
+        const userId = req.headers['user-id'] || (req.body && req.body.userId);
+        if (!isAdmin(req.tgUserId)) return res.status(403).json({ error: 'Access denied' });
+
         const body = (req.body || {});
         const category = (body.category !== undefined) ? String(body.category) : undefined;
         const name = (body.name !== undefined) ? String(body.name) : undefined;
@@ -884,11 +841,12 @@ app.put('/api/admin/product/:id', requireTelegramAuth, requireAdmin, async (req,
         res.status(500).json({ error: 'Update product error' });
     }
 });
-app.post('/api/cart/remove', requireTelegramAuth, async (req, res) => {
+app.post('/api/cart/remove', async (req, res) => {
     try {
-        const userId = req.tgUserId;
-        const { productId, removeAll } = req.body;
-        if (removeAll) await pool.query('DELETE FROM cart_items WHERE user_telegram_id = $1 AND product_id = $2', [userId, productId]);
+        const { userId: bodyUserId, productId, removeAll } = req.body;
+        const userId = String(req.tgUserId);
+        if (bodyUserId && !isAdmin(req.tgUserId) && String(bodyUserId) !== userId) return res.status(403).json({ success: false, error: 'FORBIDDEN' });
+if (removeAll) await pool.query('DELETE FROM cart_items WHERE user_telegram_id = $1 AND product_id = $2', [userId, productId]);
         else {
             const check = await pool.query('SELECT quantity FROM cart_items WHERE user_telegram_id = $1 AND product_id = $2', [userId, productId]);
             if (check.rows.length > 0 && check.rows[0].quantity > 1) await pool.query('UPDATE cart_items SET quantity = quantity - 1 WHERE user_telegram_id = $1 AND product_id = $2', [userId, productId]);
@@ -897,12 +855,15 @@ app.post('/api/cart/remove', requireTelegramAuth, async (req, res) => {
         res.json({ success: true });
     } catch (err) { res.status(500).json({ error: 'Remove cart error' }); }
 });
-app.post('/api/order', requireTelegramAuth, async (req, res) => {
+app.post('/api/order', async (req, res) => {
     const client = await pool.connect();
     try {
-        const userId = req.tgUserId;
-        const { promo_code, points_to_spend } = (req.body || {});
-        const comment = ((req.body && req.body.comment) ? String(req.body.comment) : '').trim();
+        const { userId: bodyUserId, promo_code, points_to_spend } = (req.body || {});
+        const userId = String(req.tgUserId);
+        if (bodyUserId && !isAdmin(req.tgUserId) && String(bodyUserId) !== userId) return res.status(403).json({ success: false, error: 'FORBIDDEN' });
+const comment = ((req.body && req.body.comment) ? String(req.body.comment) : '').trim();
+
+        // userId comes from validated Telegram initData
 
         // Доставка отключена — выдачу уточняем в чате
         const pickupNote = 'Уточнить выдачу в чате';
@@ -1055,20 +1016,4 @@ app.post('/api/order', requireTelegramAuth, async (req, res) => {
 });
 
 
-const server = app.listen(PORT, BIND_HOST, () => {
-    console.log(`Server running on ${BIND_HOST}:${PORT}`);
-    setupTelegramWebhook().catch((e) => console.error('❌ setupTelegramWebhook error:', e));
-});
-
-const shutdown = (signal) => {
-    console.log(`🛑 [SIGNAL] ${signal} received - Railway is stopping the container`);
-    server.close(() => {
-        console.log('✅ HTTP server closed');
-        process.exit(0);
-    });
-    // Fallback: force-exit if something hangs
-    setTimeout(() => process.exit(0), 10000).unref();
-};
-
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT', () => shutdown('SIGINT'));
+app.listen(PORT, () => { console.log(`Server running on port ${PORT}`); });
