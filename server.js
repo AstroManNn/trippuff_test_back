@@ -3,7 +3,6 @@ const cors = require('cors');
 const { Pool } = require('pg');
 const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
-const crypto = require('crypto');
 const multer = require('multer'); // Для загрузки фото
 const FormData = require('form-data');
 require('dotenv').config();
@@ -16,12 +15,7 @@ const SERVER_URL = 'https://loving-healing-production.up.railway.app';
 
 const WEBAPP_URL = process.env.WEBAPP_URL || process.env.MINI_APP_URL || process.env.FRONTEND_URL || process.env.CLIENT_URL || '';
 
-app.use(cors({
-    origin: true,
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'X-Telegram-Init-Data', 'user-id'],
-    maxAge: 86400
-}));
+app.use(cors());
 app.use(express.json());
 
 // Настройка Multer (храним фото в памяти перед отправкой в ТГ)
@@ -183,102 +177,8 @@ CREATE TABLE IF NOT EXISTS cart_items (
 initDB();
 
 // --- УТИЛИТЫ ---
-const getAdmins = () => (process.env.ADMIN_CHAT_ID || '').split(',').map(id => id.trim()).filter(Boolean);
-
-
-// --- Telegram WebApp initData auth (HMAC SHA-256) ---
-const TG_INITDATA_MAX_AGE_SEC = parseInt(process.env.TG_INITDATA_MAX_AGE_SEC || '86400', 10); // 24h default
-
-const validateTelegramInitData = (initData) => {
-    const botToken = process.env.BOT_TOKEN;
-    if (!botToken) return { ok: false, reason: 'NO_BOT_TOKEN' };
-    if (!initData || typeof initData !== 'string') return { ok: false, reason: 'NO_INITDATA' };
-
-    let params;
-    try {
-        params = new URLSearchParams(initData);
-    } catch (e) {
-        return { ok: false, reason: 'BAD_INITDATA' };
-    }
-
-    const hash = params.get('hash');
-    if (!hash) return { ok: false, reason: 'NO_HASH' };
-    params.delete('hash');
-
-    // Optional: age check
-    const authDateStr = params.get('auth_date');
-    const authDate = authDateStr ? parseInt(authDateStr, 10) : null;
-    if (Number.isFinite(authDate) && Number.isFinite(TG_INITDATA_MAX_AGE_SEC) && TG_INITDATA_MAX_AGE_SEC > 0) {
-        const nowSec = Math.floor(Date.now() / 1000);
-        // reject too old or too far in the future
-        if ((nowSec - authDate) > TG_INITDATA_MAX_AGE_SEC || (authDate - nowSec) > 60) {
-            return { ok: false, reason: 'AUTH_DATE_EXPIRED' };
-        }
-    }
-
-    const dataCheckString = Array.from(params.entries())
-        .sort(([a], [b]) => a.localeCompare(b))
-        .map(([k, v]) => `${k}=${v}`)
-        .join('\n');
-
-    // secret_key = HMAC_SHA256("WebAppData", bot_token)
-    const secretKey = crypto.createHmac('sha256', 'WebAppData').update(botToken).digest();
-    const computedHash = crypto.createHmac('sha256', secretKey).update(dataCheckString).digest('hex');
-
-    try {
-        const a = Buffer.from(computedHash, 'hex');
-        const b = Buffer.from(hash, 'hex');
-        if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
-            return { ok: false, reason: 'HASH_MISMATCH' };
-        }
-    } catch (e) {
-        return { ok: false, reason: 'HASH_COMPARE_FAILED' };
-    }
-
-    const userStr = params.get('user');
-    if (!userStr) return { ok: false, reason: 'NO_USER' };
-
-    let user;
-    try {
-        user = JSON.parse(userStr);
-    } catch (e) {
-        return { ok: false, reason: 'BAD_USER_JSON' };
-    }
-    if (!user || !user.id) return { ok: false, reason: 'NO_USER_ID' };
-
-    return { ok: true, user };
-};
-
-const requireTelegramAuth = (req, res, next) => {
-    const initData = req.get('X-Telegram-Init-Data') || '';
-    const v = validateTelegramInitData(initData);
-    if (!v.ok) return res.status(401).json({ error: 'TG_AUTH_INVALID', reason: v.reason });
-
-    req.tgUserId = String(v.user.id);
-    req.tgUsername = v.user.username ? String(v.user.username) : null;
-    req.tgFirstName = v.user.first_name ? String(v.user.first_name) : null;
-    return next();
-};
-
-const requireAdmin = (req, res, next) => {
-    if (!isAdmin(req.tgUserId)) return res.status(403).json({ error: 'Access denied' });
-    return next();
-};
-
-const requireSelfOrAdminParam = (paramName) => (req, res, next) => {
-    const target = req.params[paramName];
-    if (isAdmin(req.tgUserId)) return next();
-    if (String(req.tgUserId) !== String(target)) return res.status(403).json({ error: 'Forbidden' });
-    return next();
-};
-
-// Apply Telegram auth to all API routes (except /api/image) and allow CORS preflight OPTIONS.
-app.use((req, res, next) => {
-    if (req.method === 'OPTIONS') return next();
-    if (!req.path.startsWith('/api')) return next();
-    if (req.path.startsWith('/api/image')) return next();
-    return requireTelegramAuth(req, res, next);
-});
+const getAdmins = () => process.env.ADMIN_CHAT_ID.split(',').map(id => id.trim());
+const isAdmin = (chatId) => getAdmins().includes(chatId.toString());
 
 const normalizePromoCode = (code) => (code || '').toString().trim().toUpperCase();
 
@@ -333,7 +233,7 @@ bot.onText(/\/start/, (msg) => {
 app.post('/api/admin/product', upload.single('photo'), async (req, res) => {
     try {
         const { userId, name, category, description, price, purchase_price, stock } = req.body;
-        if (!isAdmin(req.tgUserId)) return res.status(403).json({ error: 'Access denied' });
+        if (!isAdmin(userId)) return res.status(403).json({ error: 'Access denied' });
 
         let internalLink = null;
         if (req.file) {
@@ -357,7 +257,7 @@ app.post('/api/admin/product', upload.single('photo'), async (req, res) => {
 app.post('/api/admin/products/batch', async (req, res) => {
     try {
         const { userId, products } = req.body;
-        if (!isAdmin(req.tgUserId)) return res.status(403).json({ error: 'Access denied' });
+        if (!isAdmin(userId)) return res.status(403).json({ error: 'Access denied' });
         
         const client = await pool.connect();
         try {
@@ -379,7 +279,7 @@ app.post('/api/admin/products/batch', async (req, res) => {
 app.post('/api/admin/product/:id/image', upload.single('photo'), async (req, res) => {
     try {
         const userId = req.body.userId; // Multer parses body too
-        if (!isAdmin(req.tgUserId)) return res.status(403).json({ error: 'Access denied' });
+        if (!isAdmin(userId)) return res.status(403).json({ error: 'Access denied' });
         if (!req.file) return res.status(400).json({ error: 'No photo' });
 
         const storageChatId = getAdmins()[0]; 
@@ -397,7 +297,7 @@ app.post('/api/admin/product/:id/image', upload.single('photo'), async (req, res
 app.delete('/api/admin/product/:id', async (req, res) => {
     try {
         const userId = req.headers['user-id']; 
-        if (!isAdmin(req.tgUserId)) return res.status(403).json({ error: 'Access denied' });
+        if (!isAdmin(userId)) return res.status(403).json({ error: 'Access denied' });
 
         const productId = req.params.id;
 
@@ -418,7 +318,7 @@ app.delete('/api/admin/product/:id', async (req, res) => {
 app.post('/api/admin/product/stock', async (req, res) => {
     try {
         const { userId, productId, change } = req.body;
-        if (!isAdmin(req.tgUserId)) return res.status(403).json({ error: 'Access denied' });
+        if (!isAdmin(userId)) return res.status(403).json({ error: 'Access denied' });
         await pool.query('UPDATE products SET stock = stock + $1 WHERE id = $2', [parseInt(change), productId]);
         res.json({ success: true });
     } catch (err) { res.status(500).json({ error: 'Stock update error' }); }
@@ -428,7 +328,7 @@ app.post('/api/admin/product/stock', async (req, res) => {
 app.get('/api/admin/orders', async (req, res) => {
     try {
         const { userId, status } = req.query;
-        if (!isAdmin(req.tgUserId)) return res.status(403).json({ error: 'Access denied' });
+        if (!isAdmin(userId)) return res.status(403).json({ error: 'Access denied' });
         const result = await pool.query("SELECT * FROM orders WHERE status = $1 ORDER BY id DESC LIMIT 50", [status || 'active']);
         const orders = await Promise.all(result.rows.map(async (o) => {
             const u = await pool.query(
@@ -445,7 +345,7 @@ app.get('/api/admin/orders', async (req, res) => {
 app.post('/api/admin/order/:id/done', async (req, res) => {
     try {
         const { userId } = req.body;
-        if (!isAdmin(req.tgUserId)) return res.status(403).json({ error: 'Access denied' });
+        if (!isAdmin(userId)) return res.status(403).json({ error: 'Access denied' });
         const orderRes = await pool.query("SELECT * FROM orders WHERE id = $1 AND status = 'active'", [req.params.id]);
         if (orderRes.rows.length === 0) return res.status(404).json({ error: 'Order not found' });
         const orderRow = orderRes.rows[0];
@@ -463,7 +363,7 @@ app.post('/api/admin/order/:id/done', async (req, res) => {
 app.put('/api/admin/order/:id', async (req, res) => {
     try {
         const { userId, address, comment, details, total_price } = req.body;
-        if (!isAdmin(req.tgUserId)) return res.status(403).json({ error: 'Access denied' });
+        if (!isAdmin(userId)) return res.status(403).json({ error: 'Access denied' });
         await pool.query(
             "UPDATE orders SET address = $1, comment = $2, details = $3, total_price = $4 WHERE id = $5",
             [address, comment, JSON.stringify(details), total_price, req.params.id]
@@ -476,7 +376,7 @@ app.put('/api/admin/order/:id', async (req, res) => {
 app.get('/api/admin/stats', async (req, res) => {
     try {
         const userId = req.query.userId;
-        if (!isAdmin(req.tgUserId)) return res.status(403).json({ error: 'Access denied' });
+        if (!isAdmin(userId)) return res.status(403).json({ error: 'Access denied' });
         const now = new Date();
         const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
         const endOfMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59);
@@ -501,7 +401,7 @@ app.get('/api/admin/stats', async (req, res) => {
 app.post('/api/admin/expense', async (req, res) => {
     try {
         const { userId, amount, comment } = req.body;
-        if (!isAdmin(req.tgUserId)) return res.status(403).json({ error: 'Access denied' });
+        if (!isAdmin(userId)) return res.status(403).json({ error: 'Access denied' });
         await pool.query('INSERT INTO expenses (amount, comment) VALUES ($1, $2)', [amount, comment]);
         res.json({ success: true });
     } catch (err) { res.status(500).json({ success: false }); }
@@ -512,7 +412,7 @@ const isValidTable = (t) => ['users', 'products', 'expenses', 'faq', 'orders', '
 
 app.get('/api/admin/db/:table', async (req, res) => {
     try {
-        if (!isAdmin(req.tgUserId)) return res.status(403).json({ error: 'Denied' });
+        if (!isAdmin(req.query.userId)) return res.status(403).json({ error: 'Denied' });
         if (!isValidTable(req.params.table)) return res.status(400).json({ error: 'Invalid table' });
         const result = await pool.query(`SELECT * FROM ${req.params.table} ORDER BY id DESC LIMIT 100`);
         res.json(result.rows);
@@ -522,7 +422,7 @@ app.get('/api/admin/db/:table', async (req, res) => {
 app.post('/api/admin/db/:table', async (req, res) => {
     try {
         const userId = req.headers['user-id'];
-        if (!isAdmin(req.tgUserId)) return res.status(403).json({ error: 'Denied' });
+        if (!isAdmin(userId)) return res.status(403).json({ error: 'Denied' });
         if (!isValidTable(req.params.table)) return res.status(400).json({ error: 'Invalid table' });
         const data = req.body;
         const keys = Object.keys(data);
@@ -536,7 +436,7 @@ app.post('/api/admin/db/:table', async (req, res) => {
 app.put('/api/admin/db/:table/:id', async (req, res) => {
     try {
         const userId = req.headers['user-id'];
-        if (!isAdmin(req.tgUserId)) return res.status(403).json({ error: 'Denied' });
+        if (!isAdmin(userId)) return res.status(403).json({ error: 'Denied' });
         if (!isValidTable(req.params.table)) return res.status(400).json({ error: 'Invalid table' });
         const data = req.body;
         const keys = Object.keys(data);
@@ -550,7 +450,7 @@ app.put('/api/admin/db/:table/:id', async (req, res) => {
 app.delete('/api/admin/db/:table/:id', async (req, res) => {
     try {
         const userId = req.headers['user-id'];
-        if (!isAdmin(req.tgUserId)) return res.status(403).json({ error: 'Denied' });
+        if (!isAdmin(userId)) return res.status(403).json({ error: 'Denied' });
         if (!isValidTable(req.params.table)) return res.status(400).json({ error: 'Invalid table' });
         await pool.query(`DELETE FROM ${req.params.table} WHERE id = $1`, [req.params.id]);
         res.json({ success: true });
@@ -561,7 +461,7 @@ app.delete('/api/admin/db/:table/:id', async (req, res) => {
 app.get('/api/admin/promos', async (req, res) => {
     try {
         const { userId } = req.query;
-        if (!isAdmin(req.tgUserId)) return res.status(403).json({ error: 'Access denied' });
+        if (!isAdmin(userId)) return res.status(403).json({ error: 'Access denied' });
         const result = await pool.query('SELECT * FROM promo_codes ORDER BY id DESC');
         res.json(result.rows);
     } catch (e) { res.status(500).json({ error: 'Promos error' }); }
@@ -570,7 +470,7 @@ app.get('/api/admin/promos', async (req, res) => {
 app.post('/api/admin/promos', async (req, res) => {
     try {
         const { userId, code, discount_percent } = req.body;
-        if (!isAdmin(req.tgUserId)) return res.status(403).json({ error: 'Access denied' });
+        if (!isAdmin(userId)) return res.status(403).json({ error: 'Access denied' });
         const promoCode = normalizePromoCode(code);
         const pct = clampInt(discount_percent, 1, 100);
         if (!promoCode) return res.status(400).json({ error: 'Empty code' });
@@ -585,7 +485,7 @@ app.post('/api/admin/promos', async (req, res) => {
 app.put('/api/admin/promos/:id', async (req, res) => {
     try {
         const { userId, discount_percent, is_active } = req.body;
-        if (!isAdmin(req.tgUserId)) return res.status(403).json({ error: 'Access denied' });
+        if (!isAdmin(userId)) return res.status(403).json({ error: 'Access denied' });
         const pct = discount_percent !== undefined ? clampInt(discount_percent, 1, 100) : null;
         const active = (is_active === undefined) ? null : !!is_active;
 
@@ -604,7 +504,7 @@ app.put('/api/admin/promos/:id', async (req, res) => {
 app.delete('/api/admin/promos/:id', async (req, res) => {
     try {
         const userId = req.headers['user-id'];
-        if (!isAdmin(req.tgUserId)) return res.status(403).json({ error: 'Access denied' });
+        if (!isAdmin(userId)) return res.status(403).json({ error: 'Access denied' });
         await pool.query('DELETE FROM promo_codes WHERE id = $1', [req.params.id]);
         res.json({ success: true });
     } catch (e) { res.status(500).json({ error: 'Delete promo error' }); }
@@ -620,56 +520,7 @@ app.get('/api/image/:fileId', async (req, res) => {
         response.data.pipe(res);
     } catch (e) { res.status(404).send('Not found'); }
 });
-
-app.get('/api/me', async (req, res) => {
-    try {
-        const result = await pool.query('SELECT * FROM users WHERE telegram_id = $1', [req.tgUserId]);
-        if (result.rows.length > 0) {
-            const user = result.rows[0];
-            user.is_admin = isAdmin(user.telegram_id);
-            res.json(user);
-        } else {
-            res.status(404).json({ message: 'User not found' });
-        }
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-app.get('/api/me/orders', async (req, res) => {
-    try {
-        const userId = req.tgUserId;
-        const result = await pool.query(
-            'SELECT id, details, total_price, subtotal_price, promo_code, promo_discount_percent, points_spent, points_awarded, address, comment, status, created_at FROM orders WHERE user_telegram_id = $1 ORDER BY id DESC LIMIT 100',
-            [userId]
-        );
-        const rows = result.rows.map(r => ({
-            ...r,
-            items: (() => { try { return JSON.parse(r.details); } catch { return []; } })()
-        }));
-        res.json(rows);
-    } catch (e) {
-        res.status(500).json({ error: 'Orders history error' });
-    }
-});
-
-app.get('/api/me/cart', async (req, res) => {
-    try {
-        const result = await pool.query(
-            `SELECT c.product_id, c.quantity, p.name, p.price, p.image_url
-             FROM cart_items c
-             JOIN products p ON c.product_id = p.id
-             WHERE c.user_telegram_id = $1
-             ORDER BY p.name ASC`,
-            [req.tgUserId]
-        );
-        res.json(result.rows);
-    } catch (err) {
-        res.status(500).json({ error: 'Cart error' });
-    }
-});
-
-app.get('/api/user/:id', requireSelfOrAdminParam('id'), async (req, res) => {
+app.get('/api/user/:id', async (req, res) => {
     try {
         const result = await pool.query('SELECT * FROM users WHERE telegram_id = $1', [req.params.id]);
         if (result.rows.length > 0) { const user = result.rows[0]; user.is_admin = isAdmin(req.params.id); res.json(user); } 
@@ -678,7 +529,7 @@ app.get('/api/user/:id', requireSelfOrAdminParam('id'), async (req, res) => {
 });
 
 // Get user's own order history (for profile)
-app.get('/api/user/:id/orders', requireSelfOrAdminParam('id'), async (req, res) => {
+app.get('/api/user/:id/orders', async (req, res) => {
     try {
         const userId = req.params.id;
         const result = await pool.query(
@@ -744,7 +595,7 @@ app.get('/api/reviews-channel', async (req, res) => {
 app.get('/api/faq', async (req, res) => {
     try { const result = await pool.query('SELECT * FROM faq ORDER BY id ASC'); res.json(result.rows); } catch (err) { res.status(500).json({ error: err.message }); }
 });
-app.get('/api/cart/:userId', requireSelfOrAdminParam('userId'), async (req, res) => {
+app.get('/api/cart/:userId', async (req, res) => {
     try {
         const result = await pool.query(`SELECT c.product_id, c.quantity, p.name, p.price, p.image_url FROM cart_items c JOIN products p ON c.product_id = p.id WHERE c.user_telegram_id = $1 ORDER BY p.name ASC`, [req.params.userId]);
         res.json(result.rows);
@@ -752,11 +603,10 @@ app.get('/api/cart/:userId', requireSelfOrAdminParam('userId'), async (req, res)
 });
 app.post('/api/cart/add', async (req, res) => {
     try {
-        const { userId: bodyUserId, productId } = (req.body || {});
-        const userId = String(req.tgUserId);
-        if (bodyUserId && !isAdmin(req.tgUserId) && String(bodyUserId) !== userId) return res.status(403).json({ success: false, error: 'FORBIDDEN' });
-        if (!productId) return res.status(400).json({ success: false, error: 'BAD_REQUEST' });
-// Enforce stock limit (cannot add more than available in DB)
+        const { userId, productId } = (req.body || {});
+        if (!userId || !productId) return res.status(400).json({ success: false, error: 'BAD_REQUEST' });
+
+        // Enforce stock limit (cannot add more than available in DB)
         const prodRes = await pool.query('SELECT stock FROM products WHERE id = $1', [productId]);
         const stock = prodRes.rows.length ? (parseInt(prodRes.rows[0].stock, 10) || 0) : 0;
         if (stock <= 0) {
@@ -784,7 +634,7 @@ app.put('/api/admin/product/:id', async (req, res) => {
     try {
         const id = parseInt(req.params.id, 10);
         const userId = req.headers['user-id'] || (req.body && req.body.userId);
-        if (!isAdmin(req.tgUserId)) return res.status(403).json({ error: 'Access denied' });
+        if (!isAdmin(userId)) return res.status(403).json({ error: 'Access denied' });
 
         const body = (req.body || {});
         const category = (body.category !== undefined) ? String(body.category) : undefined;
@@ -843,10 +693,8 @@ app.put('/api/admin/product/:id', async (req, res) => {
 });
 app.post('/api/cart/remove', async (req, res) => {
     try {
-        const { userId: bodyUserId, productId, removeAll } = req.body;
-        const userId = String(req.tgUserId);
-        if (bodyUserId && !isAdmin(req.tgUserId) && String(bodyUserId) !== userId) return res.status(403).json({ success: false, error: 'FORBIDDEN' });
-if (removeAll) await pool.query('DELETE FROM cart_items WHERE user_telegram_id = $1 AND product_id = $2', [userId, productId]);
+        const { userId, productId, removeAll } = req.body;
+        if (removeAll) await pool.query('DELETE FROM cart_items WHERE user_telegram_id = $1 AND product_id = $2', [userId, productId]);
         else {
             const check = await pool.query('SELECT quantity FROM cart_items WHERE user_telegram_id = $1 AND product_id = $2', [userId, productId]);
             if (check.rows.length > 0 && check.rows[0].quantity > 1) await pool.query('UPDATE cart_items SET quantity = quantity - 1 WHERE user_telegram_id = $1 AND product_id = $2', [userId, productId]);
@@ -858,12 +706,10 @@ if (removeAll) await pool.query('DELETE FROM cart_items WHERE user_telegram_id =
 app.post('/api/order', async (req, res) => {
     const client = await pool.connect();
     try {
-        const { userId: bodyUserId, promo_code, points_to_spend } = (req.body || {});
-        const userId = String(req.tgUserId);
-        if (bodyUserId && !isAdmin(req.tgUserId) && String(bodyUserId) !== userId) return res.status(403).json({ success: false, error: 'FORBIDDEN' });
-const comment = ((req.body && req.body.comment) ? String(req.body.comment) : '').trim();
+        const { userId, promo_code, points_to_spend } = (req.body || {});
+        const comment = ((req.body && req.body.comment) ? String(req.body.comment) : '').trim();
 
-        // userId comes from validated Telegram initData
+        if (!userId) return res.status(400).json({ success: false });
 
         // Доставка отключена — выдачу уточняем в чате
         const pickupNote = 'Уточнить выдачу в чате';
