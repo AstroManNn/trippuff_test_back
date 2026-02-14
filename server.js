@@ -11,7 +11,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // 👇 ВСТАВЬ СВОЮ ССЫЛКУ!
-const SERVER_URL = 'https://trippufftestback-production-2f91.up.railway.app'; 
+const SERVER_URL = 'https://trippufftestback-production-67a0.up.railway.app'; 
 
 const WEBAPP_URL = process.env.WEBAPP_URL || process.env.MINI_APP_URL || process.env.FRONTEND_URL || process.env.CLIENT_URL || '';
 
