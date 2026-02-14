@@ -37,7 +37,7 @@ const pool = new Pool({
  * ("terminated by other getUpdates request") and one of the instances gets killed/restarted.
  * We use a webhook instead.
  */
-const bot = new TelegramBot(process.env.BOT_TOKEN); // webhook mode (no polling)
+const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: false }); // explicit: no polling by default
 
 const WEBHOOK_PATH = '/telegram-webhook';
 const WEBHOOK_URL = `${SERVER_URL.replace(/\/$/, '')}${WEBHOOK_PATH}`;
@@ -1046,7 +1046,8 @@ app.listen(PORT, () => {
 });
 
 async function ensureTelegramWebhook() {
-    if (!process.env.BOT_TOKEN) return;
+    const token = process.env.BOT_TOKEN;
+    if (!token) return;
 
     // Telegram requires HTTPS for webhooks.
     if (!SERVER_URL || !/^https:\/\//i.test(SERVER_URL)) {
@@ -1054,37 +1055,99 @@ async function ensureTelegramWebhook() {
         return;
     }
 
+    const apiBase = `https://api.telegram.org/bot${token}`;
+
+    const tgPost = async (method, params = {}) => {
+        const url = `${apiBase}/${method}`;
+        const resp = await axios.post(url, null, { params, timeout: 15000 });
+        return resp.data;
+    };
+
+    const tgGet = async (method, params = {}) => {
+        const url = `${apiBase}/${method}`;
+        const resp = await axios.get(url, { params, timeout: 15000 });
+        return resp.data;
+    };
+
     try {
-        // If an old webhook/polling config exists, reset it (safe on fresh tokens too).
-        if (typeof bot.deleteWebHook === 'function') {
-            try { await bot.deleteWebHook({ drop_pending_updates: true }); } catch (_) {}
-        } else if (typeof bot.deleteWebhook === 'function') {
-            try { await bot.deleteWebhook({ drop_pending_updates: true }); } catch (_) {}
+        // Safety: if polling was started anywhere by mistake, stop it first.
+        if (typeof bot.stopPolling === 'function') {
+            try { await bot.stopPolling(); } catch (_) {}
         }
 
-        if (typeof bot.setWebHook === 'function') {
-            await bot.setWebHook(WEBHOOK_URL);
-        } else if (typeof bot.setWebhook === 'function') {
-            await bot.setWebhook(WEBHOOK_URL);
-        } else {
-            throw new Error('node-telegram-bot-api: setWebHook method not found');
-        }
+        // Reset old config (safe even on a fresh token)
+        try { await tgPost('deleteWebhook', { drop_pending_updates: true }); } catch (_) {}
 
-        console.log(`✅ Telegram webhook set: ${WEBHOOK_URL}`);
+        // Ask Telegram to set the webhook
+        const setRes = await tgPost('setWebhook', { url: WEBHOOK_URL, drop_pending_updates: true });
+        console.log('ℹ️ Telegram setWebhook:', setRes);
+        console.log(`✅ Telegram webhook requested: ${WEBHOOK_URL}`);
 
-        if (typeof bot.getWebHookInfo === 'function') {
-            try {
-                const info = await bot.getWebHookInfo();
-                console.log('ℹ️ Telegram getWebhookInfo:', info);
-            } catch (_) {}
-        } else if (typeof bot.getWebhookInfo === 'function') {
-            try {
-                const info = await bot.getWebhookInfo();
-                console.log('ℹ️ Telegram getWebhookInfo:', info);
-            } catch (_) {}
+        const infoRes = await tgGet('getWebhookInfo');
+        const info = infoRes && (infoRes.result || infoRes);
+        console.log('ℹ️ Telegram getWebhookInfo:', info);
+
+        const currentUrl = (info && info.url) ? String(info.url) : '';
+        if (currentUrl !== WEBHOOK_URL) {
+            console.warn(`⚠️ Webhook NOT active (current url="${currentUrl}").`);
+            console.warn('   Самая частая причина: где-то ещё запущен бот с ЭТИМ ЖЕ BOT_TOKEN в режиме polling (getUpdates).');
+            console.warn('   Любой вызов getUpdates автоматически СБРАСЫВАЕТ webhook, поэтому url становится пустым.');
+            console.warn('   Ниже пробую fallback на polling с DB-lock, чтобы мини-аппка заработала даже при rolling deploy.');
+            await tryStartPollingFallback();
         }
     } catch (err) {
-        const data = err && err.response && err.response.data ? err.response.data : null;
-        console.error('❌ Telegram webhook setup failed:', data || err);
+        const data = err && err.response && err.response.data ? err.response.data : err;
+        console.error('❌ Telegram webhook setup failed:', data);
+        await tryStartPollingFallback();
     }
 }
+
+function telegramLockKeyFromToken(token) {
+    // Stable positive int for pg advisory lock (fits into bigint).
+    // We keep it deterministic so all replicas contend for the same lock.
+    let h = 0;
+    const s = String(token || '');
+    for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
+    return Math.abs(h);
+}
+
+async function tryStartPollingFallback() {
+    if (!process.env.BOT_TOKEN) return;
+    if (!pool) return;
+
+    try {
+        const lockKey = telegramLockKeyFromToken(process.env.BOT_TOKEN);
+
+        // Only ONE instance will acquire this lock -> avoids 409 on rolling deploy.
+        const r = await pool.query('SELECT pg_try_advisory_lock($1::bigint) AS locked', [String(lockKey)]);
+        const locked = !!(r.rows && r.rows[0] && r.rows[0].locked);
+
+        if (!locked) {
+            console.warn('ℹ️ Polling fallback skipped: advisory lock not acquired (another instance is already the poller).');
+            return;
+        }
+
+        console.warn('⚠️ Starting polling fallback (webhook not active).');
+        if (typeof bot.startPolling === 'function') {
+            bot.startPolling({ restart: true, polling: { interval: 1000, params: { timeout: 10 } } });
+        } else {
+            console.error('❌ node-telegram-bot-api: startPolling method not found');
+        }
+    } catch (e) {
+        const data = e && e.response && e.response.data ? e.response.data : e;
+        console.error('❌ Polling fallback failed:', data);
+    }
+}
+
+// Extra visibility: if polling is active and we still get 409, it's DEFINITELY another getUpdates requester somewhere.
+bot.on('polling_error', (err) => {
+    const msg = (err && err.message) ? String(err.message) : String(err);
+    if (msg.includes('409') || msg.includes('Conflict')) {
+        console.error('🛑 Telegram polling 409 Conflict: ещё где-то запущен getUpdates для этого BOT_TOKEN.');
+        console.error('   Останови/удали второй инстанс/сервис (Railway replicas/другой проект/локальный запуск) или переведи его на webhook.');
+        try { bot.stopPolling(); } catch (_) {}
+    } else {
+        console.error('❌ Telegram polling_error:', err && err.response && err.response.data ? err.response.data : err);
+    }
+});
+
