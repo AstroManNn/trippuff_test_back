@@ -24,49 +24,66 @@ process.on('uncaughtException', (err) => {
 
 
 const app = express();
+app.enable('trust proxy');
 const PORT = Number.parseInt(process.env.PORT || '', 10) || 8080;
 
 // 👇 ВСТАВЬ СВОЮ ССЫЛКУ!
 const SERVER_URL = 'https://trippufftestback-production-67a0.up.railway.app'; 
 
 const WEBAPP_URL = process.env.WEBAPP_URL || process.env.MINI_APP_URL || process.env.FRONTEND_URL || process.env.CLIENT_URL || '';
+const APP_BUILD = process.env.APP_BUILD || '2026-02-15-v14';
+function withBuildParam(url) {
+    if (!url) return url;
+    const hasQ = url.includes('?');
+    const sep = hasQ ? '&' : '?';
+    // Avoid duplicate v= params if user already set one
+    if (/([?&])v=/.test(url)) return url;
+    return `${url}${sep}v=${encodeURIComponent(APP_BUILD)}`;
+}
 
 
-/**
- * CORS (GitHub Pages / Telegram WebApp)
- * Telegram WebView + GitHub Pages -> cross-origin fetch. Some requests trigger preflight (OPTIONS),
- * and Telegram webviews may include extra headers. We reflect Origin and echo requested headers so
- * preflight never fails.
- */
+// --- CORS (GitHub Pages / Telegram WebView friendly) ---
 app.use((req, res, next) => {
-  const origin = req.headers.origin;
-  if (origin) {
-    res.setHeader('Access-Control-Allow-Origin', origin);
-    res.setHeader('Vary', 'Origin');
-  } else {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-  }
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
-  const reqHeaders = req.headers['access-control-request-headers'];
-  res.setHeader('Access-Control-Allow-Headers', reqHeaders || 'Content-Type, user-id, X-Telegram-Init-Data');
-  res.setHeader('Access-Control-Max-Age', '86400');
-  if (req.method === 'OPTIONS') return res.sendStatus(204);
-  next();
+    const origin = req.get('origin');
+    if (origin) {
+        res.setHeader('Access-Control-Allow-Origin', origin);
+        res.setHeader('Vary', 'Origin');
+        res.setHeader('Access-Control-Allow-Credentials', 'true');
+    } else {
+        res.setHeader('Access-Control-Allow-Origin', '*');
+    }
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+    const reqHeaders = req.get('access-control-request-headers');
+    res.setHeader('Access-Control-Allow-Headers', reqHeaders || 'Content-Type, Authorization, X-Requested-With, user-id, X-Telegram-Init-Data');
+    if (req.method === 'OPTIONS') return res.sendStatus(204);
+    next();
 });
 
-// Minimal request log to confirm frontend requests reach the backend
+// --- HTTP request logs (so we can prove whether the Mini App actually sends requests) ---
 app.use((req, res, next) => {
-  if (req.path.startsWith('/api') || req.path.startsWith('/telegram-webhook') || req.path === '/health') {
-    const start = Date.now();
-    console.log(`➡️ [HTTP] ${req.method} ${req.path} origin=${req.headers.origin || ''} acrh=${req.headers['access-control-request-headers'] || ''}`);
+    const path = req.path || '';
+    const shouldLog = path.startsWith('/api/') || path === '/health' || path === '/__ping.gif';
+    if (!shouldLog) return next();
+    const t0 = Date.now();
+    console.log('➡️ [HTTP]', req.method, path, { origin: req.get('origin') || '', referer: req.get('referer') || '' });
     res.on('finish', () => {
-      console.log(`⬅️ [HTTP] ${req.method} ${req.path} ${res.statusCode} ${Date.now() - start}ms`);
+        console.log('⬅️ [HTTP]', req.method, path, res.statusCode, (Date.now() - t0) + 'ms');
     });
-  }
-  next();
+    next();
 });
 
-app.use(express.json({ limit: '2mb' }));
+// Frontend beacon (does NOT require CORS). Used to verify Telegram is loading the latest index.html build.
+const ONE_BY_ONE_GIF = Buffer.from('R0lGODlhAQABAPAAAP///wAAACH5BAAAAAAALAAAAAABAAEAAAICRAEAOw==', 'base64');
+app.get('/__ping.gif', (req, res) => {
+    console.log('🟡 [PING] beacon', { b: req.query && req.query.b, stage: req.query && req.query.stage, uid: req.query && req.query.uid, ua: (req.get('user-agent') || '').slice(0, 80) });
+    res.setHeader('Content-Type', 'image/gif');
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+    return res.status(200).send(ONE_BY_ONE_GIF);
+});
+
+app.use(express.json());
 
 // Health endpoints (helps Railway healthchecks + quick manual testing)
 app.get('/', (req, res) => res.status(200).send('ok'));
@@ -287,7 +304,7 @@ const clampInt = (v, min, max) => {
 bot.onText(/\/start/, (msg) => {
     const chatId = msg.chat.id;
     const text = 'Привет! Просмотр каталога и оформление заказа по кнопке ниже⬇️';
-    const url = WEBAPP_URL;
+    const url = withBuildParam(WEBAPP_URL);
 
     if (url) {
         bot.sendMessage(chatId, text, {
