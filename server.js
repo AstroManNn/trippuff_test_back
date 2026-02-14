@@ -31,8 +31,42 @@ const SERVER_URL = 'https://trippufftestback-production-67a0.up.railway.app';
 
 const WEBAPP_URL = process.env.WEBAPP_URL || process.env.MINI_APP_URL || process.env.FRONTEND_URL || process.env.CLIENT_URL || '';
 
-app.use(cors());
-app.use(express.json());
+
+/**
+ * CORS (GitHub Pages / Telegram WebApp)
+ * Telegram WebView + GitHub Pages -> cross-origin fetch. Some requests trigger preflight (OPTIONS),
+ * and Telegram webviews may include extra headers. We reflect Origin and echo requested headers so
+ * preflight never fails.
+ */
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+  } else {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+  }
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+  const reqHeaders = req.headers['access-control-request-headers'];
+  res.setHeader('Access-Control-Allow-Headers', reqHeaders || 'Content-Type, user-id, X-Telegram-Init-Data');
+  res.setHeader('Access-Control-Max-Age', '86400');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
+// Minimal request log to confirm frontend requests reach the backend
+app.use((req, res, next) => {
+  if (req.path.startsWith('/api') || req.path.startsWith('/telegram-webhook') || req.path === '/health') {
+    const start = Date.now();
+    console.log(`➡️ [HTTP] ${req.method} ${req.path} origin=${req.headers.origin || ''} acrh=${req.headers['access-control-request-headers'] || ''}`);
+    res.on('finish', () => {
+      console.log(`⬅️ [HTTP] ${req.method} ${req.path} ${res.statusCode} ${Date.now() - start}ms`);
+    });
+  }
+  next();
+});
+
+app.use(express.json({ limit: '2mb' }));
 
 // Health endpoints (helps Railway healthchecks + quick manual testing)
 app.get('/', (req, res) => res.status(200).send('ok'));
