@@ -7,88 +7,16 @@ const multer = require('multer'); // Для загрузки фото
 const FormData = require('form-data');
 require('dotenv').config();
 
-// --- BOOT DIAGNOSTICS (Railway-friendly) ---
-console.log('🟣 [BOOT] starting server file:', __filename);
-console.log('🟣 [BOOT] node:', process.version, 'pid:', process.pid);
-console.log('🟣 [BOOT] env PORT=', process.env.PORT, '-> listen PORT=', (Number.parseInt(process.env.PORT || '', 10) || 8080));
-console.log('🟣 [BOOT] env RAILWAY_ENVIRONMENT=', process.env.RAILWAY_ENVIRONMENT || '');
-console.log('🟣 [BOOT] env RAILWAY_PUBLIC_DOMAIN=', process.env.RAILWAY_PUBLIC_DOMAIN || '');
-
-process.on('unhandledRejection', (err) => {
-  console.error('❌ [FATAL] unhandledRejection:', err);
-});
-process.on('uncaughtException', (err) => {
-  console.error('❌ [FATAL] uncaughtException:', err);
-});
-// ------------------------------------------
-
-
 const app = express();
-app.enable('trust proxy');
-const PORT = Number.parseInt(process.env.PORT || '', 10) || 8080;
+const PORT = process.env.PORT || 3000;
 
 // 👇 ВСТАВЬ СВОЮ ССЫЛКУ!
 const SERVER_URL = 'https://trippufftestback-production-67a0.up.railway.app'; 
 
 const WEBAPP_URL = process.env.WEBAPP_URL || process.env.MINI_APP_URL || process.env.FRONTEND_URL || process.env.CLIENT_URL || '';
-const APP_BUILD = process.env.APP_BUILD || '2026-02-15-v14';
-function withBuildParam(url) {
-    if (!url) return url;
-    const hasQ = url.includes('?');
-    const sep = hasQ ? '&' : '?';
-    // Avoid duplicate v= params if user already set one
-    if (/([?&])v=/.test(url)) return url;
-    return `${url}${sep}v=${encodeURIComponent(APP_BUILD)}`;
-}
 
-
-// --- CORS (GitHub Pages / Telegram WebView friendly) ---
-app.use((req, res, next) => {
-    const origin = req.get('origin');
-    if (origin) {
-        res.setHeader('Access-Control-Allow-Origin', origin);
-        res.setHeader('Vary', 'Origin');
-        res.setHeader('Access-Control-Allow-Credentials', 'true');
-    } else {
-        res.setHeader('Access-Control-Allow-Origin', '*');
-    }
-    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
-    const reqHeaders = req.get('access-control-request-headers');
-    res.setHeader('Access-Control-Allow-Headers', reqHeaders || 'Content-Type, Authorization, X-Requested-With, user-id, X-Telegram-Init-Data');
-    if (req.method === 'OPTIONS') return res.sendStatus(204);
-    next();
-});
-
-// --- HTTP request logs (so we can prove whether the Mini App actually sends requests) ---
-app.use((req, res, next) => {
-    const path = req.path || '';
-    const shouldLog = path.startsWith('/api/') || path === '/health' || path === '/__ping.gif';
-    if (!shouldLog) return next();
-    const t0 = Date.now();
-    console.log('➡️ [HTTP]', req.method, path, { origin: req.get('origin') || '', referer: req.get('referer') || '' });
-    res.on('finish', () => {
-        console.log('⬅️ [HTTP]', req.method, path, res.statusCode, (Date.now() - t0) + 'ms');
-    });
-    next();
-});
-
-// Frontend beacon (does NOT require CORS). Used to verify Telegram is loading the latest index.html build.
-const ONE_BY_ONE_GIF = Buffer.from('R0lGODlhAQABAPAAAP///wAAACH5BAAAAAAALAAAAAABAAEAAAICRAEAOw==', 'base64');
-app.get('/__ping.gif', (req, res) => {
-    console.log('🟡 [PING] beacon', { b: req.query && req.query.b, stage: req.query && req.query.stage, uid: req.query && req.query.uid, ua: (req.get('user-agent') || '').slice(0, 80) });
-    res.setHeader('Content-Type', 'image/gif');
-    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
-    res.setHeader('Pragma', 'no-cache');
-    res.setHeader('Expires', '0');
-    return res.status(200).send(ONE_BY_ONE_GIF);
-});
-
+app.use(cors());
 app.use(express.json());
-
-// Health endpoints (helps Railway healthchecks + quick manual testing)
-app.get('/', (req, res) => res.status(200).send('ok'));
-app.get('/health', (req, res) => res.status(200).json({ ok: true }));
-
 
 // Настройка Multer (храним фото в памяти перед отправкой в ТГ)
 const upload = multer({ storage: multer.memoryStorage() });
@@ -102,31 +30,7 @@ const pool = new Pool({
     ssl: { rejectUnauthorized: false }
 });
 
-/**
- * IMPORTANT:
- * Do NOT use long polling (getUpdates) on Railway / platforms with rolling deploys:
- * during deploy there may be two instances briefly -> Telegram returns 409 Conflict
- * ("terminated by other getUpdates request") and one of the instances gets killed/restarted.
- * We use a webhook instead.
- */
-const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: false }); // explicit: no polling by default
-
-const WEBHOOK_PATH = '/telegram-webhook';
-const WEBHOOK_URL = `${SERVER_URL.replace(/\/$/, '')}${WEBHOOK_PATH}`;
-
-// Telegram sends updates here (incl. /start)
-app.get(WEBHOOK_PATH, (req, res) => res.status(200).send('ok'));
-
-app.post(WEBHOOK_PATH, (req, res) => {
-    try {
-        const u = req.body || {};
-        const updateId = (u.update_id !== undefined) ? u.update_id : null;
-        const kind = u.message ? 'message' : (u.callback_query ? 'callback_query' : (u.inline_query ? 'inline_query' : 'other'));
-        console.log('📩 [TG] update received:', { update_id: updateId, kind });
-        bot.processUpdate(u);
-    } catch (e) { console.error('❌ processUpdate error:', e); }
-    res.sendStatus(200);
-});
+const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
 
 // --- БД ---
 const initDB = async () => {
@@ -304,7 +208,7 @@ const clampInt = (v, min, max) => {
 bot.onText(/\/start/, (msg) => {
     const chatId = msg.chat.id;
     const text = 'Привет! Просмотр каталога и оформление заказа по кнопке ниже⬇️';
-    const url = withBuildParam(WEBAPP_URL);
+    const url = WEBAPP_URL;
 
     if (url) {
         bot.sendMessage(chatId, text, {
@@ -1120,131 +1024,4 @@ app.post('/api/order', async (req, res) => {
 });
 
 
-const server = app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server running on port ${PORT}`);
-    ensureTelegramWebhook();
-});
-
-async function ensureTelegramWebhook() {
-    const token = process.env.BOT_TOKEN;
-    if (!token) return;
-
-    // Telegram requires HTTPS for webhooks.
-    if (!SERVER_URL || !/^https:\/\//i.test(SERVER_URL)) {
-        console.warn('⚠️ SERVER_URL must be https to receive Telegram webhooks. Current:', SERVER_URL);
-        return;
-    }
-
-    const apiBase = `https://api.telegram.org/bot${token}`;
-
-    const tgPost = async (method, params = {}) => {
-        const url = `${apiBase}/${method}`;
-        const resp = await axios.post(url, null, { params, timeout: 15000 });
-        return resp.data;
-    };
-
-    const tgGet = async (method, params = {}) => {
-        const url = `${apiBase}/${method}`;
-        const resp = await axios.get(url, { params, timeout: 15000 });
-        return resp.data;
-    };
-
-    try {
-        // Safety: if polling was started anywhere by mistake, stop it first.
-        if (typeof bot.stopPolling === 'function') {
-            try { await bot.stopPolling(); } catch (_) {}
-        }
-
-        // Reset old config (safe even on a fresh token)
-        try { await tgPost('deleteWebhook', { drop_pending_updates: true }); } catch (_) {}
-
-        // Ask Telegram to set the webhook
-        const setRes = await tgPost('setWebhook', { url: WEBHOOK_URL, drop_pending_updates: true });
-        console.log('ℹ️ Telegram setWebhook:', setRes);
-        console.log(`✅ Telegram webhook requested: ${WEBHOOK_URL}`);
-
-        const infoRes = await tgGet('getWebhookInfo');
-        const info = infoRes && (infoRes.result || infoRes);
-        console.log('ℹ️ Telegram getWebhookInfo:', info);
-
-        const currentUrl = (info && info.url) ? String(info.url) : '';
-        if (currentUrl !== WEBHOOK_URL) {
-            console.warn(`⚠️ Webhook NOT active (current url="${currentUrl}").`);
-            console.warn('   Самая частая причина: где-то ещё запущен бот с ЭТИМ ЖЕ BOT_TOKEN в режиме polling (getUpdates).');
-            console.warn('   Любой вызов getUpdates автоматически СБРАСЫВАЕТ webhook, поэтому url становится пустым.');
-            console.warn('   Ниже пробую fallback на polling с DB-lock, чтобы мини-аппка заработала даже при rolling deploy.');
-            await tryStartPollingFallback();
-        }
-    } catch (err) {
-        const data = err && err.response && err.response.data ? err.response.data : err;
-        console.error('❌ Telegram webhook setup failed:', data);
-        await tryStartPollingFallback();
-    }
-}
-
-function telegramLockKeyFromToken(token) {
-    // Stable positive int for pg advisory lock (fits into bigint).
-    // We keep it deterministic so all replicas contend for the same lock.
-    let h = 0;
-    const s = String(token || '');
-    for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
-    return Math.abs(h);
-}
-
-async function tryStartPollingFallback() {
-    if (!process.env.BOT_TOKEN) return;
-    if (!pool) return;
-
-    try {
-        const lockKey = telegramLockKeyFromToken(process.env.BOT_TOKEN);
-
-        // Only ONE instance will acquire this lock -> avoids 409 on rolling deploy.
-        const r = await pool.query('SELECT pg_try_advisory_lock($1::bigint) AS locked', [String(lockKey)]);
-        const locked = !!(r.rows && r.rows[0] && r.rows[0].locked);
-
-        if (!locked) {
-            console.warn('ℹ️ Polling fallback skipped: advisory lock not acquired (another instance is already the poller).');
-            return;
-        }
-
-        console.warn('⚠️ Starting polling fallback (webhook not active).');
-        if (typeof bot.startPolling === 'function') {
-            bot.startPolling({ restart: true, polling: { interval: 1000, params: { timeout: 10 } } });
-        } else {
-            console.error('❌ node-telegram-bot-api: startPolling method not found');
-        }
-    } catch (e) {
-        const data = e && e.response && e.response.data ? e.response.data : e;
-        console.error('❌ Polling fallback failed:', data);
-    }
-}
-
-// Extra visibility: if polling is active and we still get 409, it's DEFINITELY another getUpdates requester somewhere.
-bot.on('polling_error', (err) => {
-    const msg = (err && err.message) ? String(err.message) : String(err);
-    if (msg.includes('409') || msg.includes('Conflict')) {
-        console.error('🛑 Telegram polling 409 Conflict: ещё где-то запущен getUpdates для этого BOT_TOKEN.');
-        console.error('   Останови/удали второй инстанс/сервис (Railway replicas/другой проект/локальный запуск) или переведи его на webhook.');
-        try { bot.stopPolling(); } catch (_) {}
-    } else {
-        console.error('❌ Telegram polling_error:', err && err.response && err.response.data ? err.response.data : err);
-    }
-});
-
-
-
-
-// Graceful shutdown (Railway sends SIGTERM on redeploy)
-process.on('SIGTERM', () => {
-  console.log('🛑 [SIGNAL] SIGTERM received - shutting down...');
-  try {
-    server.close(() => {
-      console.log('✅ HTTP server closed');
-      process.exit(0);
-    });
-    // Force-exit if something hangs
-    setTimeout(() => process.exit(0), 5000).unref();
-  } catch (e) {
-    process.exit(0);
-  }
-});
+app.listen(PORT, () => { console.log(`Server running on port ${PORT}`); });
