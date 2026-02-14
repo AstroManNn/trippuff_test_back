@@ -7,8 +7,24 @@ const multer = require('multer'); // Для загрузки фото
 const FormData = require('form-data');
 require('dotenv').config();
 
+// --- BOOT DIAGNOSTICS (Railway-friendly) ---
+console.log('🟣 [BOOT] starting server file:', __filename);
+console.log('🟣 [BOOT] node:', process.version, 'pid:', process.pid);
+console.log('🟣 [BOOT] env PORT=', process.env.PORT, '-> listen PORT=', (Number.parseInt(process.env.PORT || '', 10) || 8080));
+console.log('🟣 [BOOT] env RAILWAY_ENVIRONMENT=', process.env.RAILWAY_ENVIRONMENT || '');
+console.log('🟣 [BOOT] env RAILWAY_PUBLIC_DOMAIN=', process.env.RAILWAY_PUBLIC_DOMAIN || '');
+
+process.on('unhandledRejection', (err) => {
+  console.error('❌ [FATAL] unhandledRejection:', err);
+});
+process.on('uncaughtException', (err) => {
+  console.error('❌ [FATAL] uncaughtException:', err);
+});
+// ------------------------------------------
+
+
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = Number.parseInt(process.env.PORT || '', 10) || 8080;
 
 // 👇 ВСТАВЬ СВОЮ ССЫЛКУ!
 const SERVER_URL = 'https://trippufftestback-production-67a0.up.railway.app'; 
@@ -17,6 +33,11 @@ const WEBAPP_URL = process.env.WEBAPP_URL || process.env.MINI_APP_URL || process
 
 app.use(cors());
 app.use(express.json());
+
+// Health endpoints (helps Railway healthchecks + quick manual testing)
+app.get('/', (req, res) => res.status(200).send('ok'));
+app.get('/health', (req, res) => res.status(200).json({ ok: true }));
+
 
 // Настройка Multer (храним фото в памяти перед отправкой в ТГ)
 const upload = multer({ storage: multer.memoryStorage() });
@@ -43,8 +64,16 @@ const WEBHOOK_PATH = '/telegram-webhook';
 const WEBHOOK_URL = `${SERVER_URL.replace(/\/$/, '')}${WEBHOOK_PATH}`;
 
 // Telegram sends updates here (incl. /start)
+app.get(WEBHOOK_PATH, (req, res) => res.status(200).send('ok'));
+
 app.post(WEBHOOK_PATH, (req, res) => {
-    try { bot.processUpdate(req.body); } catch (e) { console.error('❌ processUpdate error:', e); }
+    try {
+        const u = req.body || {};
+        const updateId = (u.update_id !== undefined) ? u.update_id : null;
+        const kind = u.message ? 'message' : (u.callback_query ? 'callback_query' : (u.inline_query ? 'inline_query' : 'other'));
+        console.log('📩 [TG] update received:', { update_id: updateId, kind });
+        bot.processUpdate(u);
+    } catch (e) { console.error('❌ processUpdate error:', e); }
     res.sendStatus(200);
 });
 
@@ -1040,7 +1069,7 @@ app.post('/api/order', async (req, res) => {
 });
 
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on port ${PORT}`);
     ensureTelegramWebhook();
 });
@@ -1151,3 +1180,20 @@ bot.on('polling_error', (err) => {
     }
 });
 
+
+
+
+// Graceful shutdown (Railway sends SIGTERM on redeploy)
+process.on('SIGTERM', () => {
+  console.log('🛑 [SIGNAL] SIGTERM received - shutting down...');
+  try {
+    server.close(() => {
+      console.log('✅ HTTP server closed');
+      process.exit(0);
+    });
+    // Force-exit if something hangs
+    setTimeout(() => process.exit(0), 5000).unref();
+  } catch (e) {
+    process.exit(0);
+  }
+});
