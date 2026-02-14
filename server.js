@@ -329,7 +329,14 @@ app.get('/api/admin/orders', async (req, res) => {
     try {
         const { userId, status } = req.query;
         if (!isAdmin(userId)) return res.status(403).json({ error: 'Access denied' });
-        const result = await pool.query("SELECT * FROM orders WHERE status = $1 ORDER BY id DESC LIMIT 50", [status || 'active']);
+
+        // Backward-compatible behavior:
+        // - Admin UI historically запросит status=active / status=completed.
+        // - Теперь новые заказы создаются со статусом 'pending' и должны быть видны в "Активные".
+        const want = (status || 'active').toString();
+        const result = (want === 'active')
+            ? await pool.query("SELECT * FROM orders WHERE status IN ('pending','active') ORDER BY id DESC LIMIT 50")
+            : await pool.query("SELECT * FROM orders WHERE status = $1 ORDER BY id DESC LIMIT 50", [want]);
         const orders = await Promise.all(result.rows.map(async (o) => {
             const u = await pool.query(
                 "SELECT COALESCE(nickname, name) AS nickname, username FROM users WHERE telegram_id = $1",
@@ -339,6 +346,90 @@ app.get('/api/admin/orders', async (req, res) => {
         }));
         res.json(orders);
     } catch (err) { res.status(500).json({ error: 'Orders error' }); }
+});
+
+// 3.1 Принять заказ (списание со склада происходит только здесь)
+app.post('/api/admin/order/:id/accept', async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const { userId } = (req.body || {});
+        if (!isAdmin(userId)) return res.status(403).json({ error: 'Access denied' });
+
+        const orderId = parseInt(req.params.id, 10);
+        if (!Number.isFinite(orderId)) return res.status(400).json({ error: 'Bad order id' });
+
+        await client.query('BEGIN');
+
+        const orderRes = await client.query('SELECT * FROM orders WHERE id = $1 FOR UPDATE', [orderId]);
+        if (orderRes.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Order not found' });
+        }
+
+        const orderRow = orderRes.rows[0];
+
+        // idempotency / state checks
+        const st = (orderRow.status || '').toString();
+        if (st === 'completed') {
+            await client.query('ROLLBACK');
+            return res.status(409).json({ error: 'Order already completed' });
+        }
+        if (st === 'active') {
+            await client.query('COMMIT');
+            return res.json({ success: true, alreadyAccepted: true });
+        }
+        if (st !== 'pending') {
+            await client.query('ROLLBACK');
+            return res.status(409).json({ error: 'Invalid order status' });
+        }
+
+        let items = [];
+        try { items = JSON.parse(orderRow.details || '[]'); } catch (e) { items = []; }
+        if (!Array.isArray(items) || items.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'Order is empty' });
+        }
+
+        // Lock all involved products, check stock, then decrement.
+        const productIds = Array.from(new Set(items.map(i => i && i.product_id).filter(Boolean)));
+        const prodRes = await client.query(
+            'SELECT id, stock FROM products WHERE id = ANY($1) FOR UPDATE',
+            [productIds]
+        );
+        const stockMap = new Map(prodRes.rows.map(r => [Number(r.id), parseInt(r.stock, 10) || 0]));
+
+        const 부족 = [];
+        for (const it of items) {
+            const pid = Number(it.product_id);
+            const qty = parseInt(it.quantity, 10) || 0;
+            const stock = stockMap.has(pid) ? stockMap.get(pid) : null;
+            if (!pid || qty <= 0 || stock === null || stock < qty) {
+                부족.push({ product_id: pid || null, requested: qty, stock: stock === null ? null : stock });
+            }
+        }
+
+        if (부족.length > 0) {
+            await client.query('ROLLBACK');
+            return res.status(409).json({ error: 'OUT_OF_STOCK', details: 부족 });
+        }
+
+        for (const it of items) {
+            const pid = Number(it.product_id);
+            const qty = parseInt(it.quantity, 10) || 0;
+            await client.query('UPDATE products SET stock = stock - $1 WHERE id = $2', [qty, pid]);
+        }
+
+        await client.query("UPDATE orders SET status = 'active' WHERE id = $1", [orderId]);
+
+        await client.query('COMMIT');
+        res.json({ success: true });
+    } catch (e) {
+        try { await client.query('ROLLBACK'); } catch (_e) {}
+        console.error(e);
+        res.status(500).json({ error: 'Accept error' });
+    } finally {
+        client.release();
+    }
 });
 
 // 4. Завершить заказ
@@ -357,6 +448,86 @@ app.post('/api/admin/order/:id/done', async (req, res) => {
         await pool.query("UPDATE orders SET status = 'completed', points_awarded = $1 WHERE id = $2", [pointsEarned, req.params.id]);
         res.json({ success: true, points_awarded: pointsEarned });
     } catch (err) { res.status(500).json({ error: 'Done error' }); }
+});
+
+// 4.1 Принять заказ (списать товар со склада)
+app.post('/api/admin/order/:id/accept', async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const { userId } = (req.body || {});
+        if (!isAdmin(userId)) return res.status(403).json({ error: 'Access denied' });
+
+        const orderId = parseInt(req.params.id, 10);
+        if (!Number.isFinite(orderId)) return res.status(400).json({ error: 'Bad order id' });
+
+        await client.query('BEGIN');
+
+        const orderRes = await client.query('SELECT * FROM orders WHERE id = $1 FOR UPDATE', [orderId]);
+        if (orderRes.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Order not found' });
+        }
+
+        const order = orderRes.rows[0];
+
+        if (order.status === 'completed') {
+            await client.query('ROLLBACK');
+            return res.status(409).json({ error: 'Order already completed' });
+        }
+
+        // idempotency: if already accepted
+        if (order.status === 'active') {
+            await client.query('COMMIT');
+            return res.json({ success: true, alreadyAccepted: true });
+        }
+
+        // Only pending orders require acceptance.
+        const items = (() => { try { return JSON.parse(order.details); } catch { return []; } })();
+        if (!Array.isArray(items) || items.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'Empty order items' });
+        }
+
+        const productIds = Array.from(new Set(items.map(i => parseInt(i.product_id, 10)).filter(n => Number.isFinite(n))));
+        if (productIds.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'Empty product ids' });
+        }
+
+        // Lock products to prevent concurrent stock changes while we check + decrement
+        const prodRes = await client.query('SELECT id, stock FROM products WHERE id = ANY($1) FOR UPDATE', [productIds]);
+        const stockById = new Map(prodRes.rows.map(r => [parseInt(r.id, 10), parseInt(r.stock, 10) || 0]));
+
+        const insuff = [];
+        for (const it of items) {
+            const pid = parseInt(it.product_id, 10);
+            const qty = parseInt(it.quantity, 10) || 0;
+            const stock = stockById.has(pid) ? stockById.get(pid) : null;
+            if (!pid || qty <= 0 || stock === null || stock < qty) {
+                insuff.push({ product_id: pid, requested: qty, stock: stock === null ? 0 : stock, name: it.name || '' });
+            }
+        }
+
+        if (insuff.length > 0) {
+            await client.query('ROLLBACK');
+            return res.status(409).json({ error: 'OUT_OF_STOCK', items: insuff });
+        }
+
+        for (const it of items) {
+            const pid = parseInt(it.product_id, 10);
+            const qty = parseInt(it.quantity, 10) || 0;
+            await client.query('UPDATE products SET stock = stock - $1 WHERE id = $2', [qty, pid]);
+        }
+
+        await client.query("UPDATE orders SET status = 'active' WHERE id = $1", [orderId]);
+        await client.query('COMMIT');
+        res.json({ success: true });
+    } catch (err) {
+        try { await client.query('ROLLBACK'); } catch (e) {}
+        res.status(500).json({ error: 'Accept error' });
+    } finally {
+        client.release();
+    }
 });
 
 // 5. Редактировать заказ
@@ -792,17 +963,8 @@ app.post('/api/order', async (req, res) => {
 
         const totalPrice = Math.max(0, Math.ceil(afterPromo - pointsSpent));
 
-        // Списываем товар со склада СРАЗУ после оформления заказа
-        for (const item of itemsRaw) {
-            const upd = await client.query(
-                'UPDATE products SET stock = stock - $1 WHERE id = $2 AND stock >= $1 RETURNING stock',
-                [item.quantity, item.product_id]
-            );
-            if (upd.rowCount === 0) {
-                await client.query('ROLLBACK');
-                return res.status(409).json({ success: false, error: 'OUT_OF_STOCK', product_id: item.product_id });
-            }
-        }
+        // ВАЖНО: товар НЕ списываем со склада на этапе оформления заказа.
+        // Списание происходит только после принятия заказа админом (см. /api/admin/order/:id/accept).
 
         const safeUsername = (user.username || '').toString().trim().replace(/^@/, '');
         const userLinkHtml = safeUsername
@@ -810,11 +972,11 @@ app.post('/api/order', async (req, res) => {
             : `<a href="tg://user?id=${user.telegram_id}">ID:${user.telegram_id}</a>`;
         const promoLine = appliedPromoCode ? `\n🎟 <b>Промокод:</b> ${escapeHtml(appliedPromoCode)} (-${promoPercent}%)` : '';
         const pointsLine = pointsSpent > 0 ? `\n⭐️ <b>Списано баллов:</b> ${pointsSpent}` : '';
-        const orderText = `📦 <b>НОВЫЙ ЗАКАЗ</b>\n\n👤 <b>Клиент:</b> ${userLinkHtml}\n📝 <b>Выдача:</b> ${escapeHtml(pickupNote)}\n\n${itemsListText}${promoLine}${pointsLine}\n💰 <b>ИТОГО: ${totalPrice}₽</b>`;
+        const orderText = `📦 <b>НОВЫЙ ЗАКАЗ</b>\n\n👤 <b>Клиент:</b> ${userLinkHtml}\n📝 <b>Выдача:</b> ${escapeHtml(pickupNote)}\n\n${itemsListText}${promoLine}${pointsLine}\n💰 <b>ИТОГО: ${totalPrice}₽</b>\n\n⏳ <i>Ожидает принятия в админ-панели</i>`;
 
         const newOrder = await client.query(
             'INSERT INTO orders (user_telegram_id, details, total_price, subtotal_price, promo_code, promo_discount_percent, points_spent, address, comment, status) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id',
-            [userId, JSON.stringify(orderDetails), totalPrice, subtotal, appliedPromoCode, promoPercent, pointsSpent, address, comment, 'active']
+            [userId, JSON.stringify(orderDetails), totalPrice, subtotal, appliedPromoCode, promoPercent, pointsSpent, address, comment, 'pending']
         );
 
         if (pointsSpent > 0) {
