@@ -30,7 +30,23 @@ const pool = new Pool({
     ssl: { rejectUnauthorized: false }
 });
 
-const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
+/**
+ * IMPORTANT:
+ * Do NOT use long polling (getUpdates) on Railway / platforms with rolling deploys:
+ * during deploy there may be two instances briefly -> Telegram returns 409 Conflict
+ * ("terminated by other getUpdates request") and one of the instances gets killed/restarted.
+ * We use a webhook instead.
+ */
+const bot = new TelegramBot(process.env.BOT_TOKEN); // webhook mode (no polling)
+
+const WEBHOOK_PATH = '/telegram-webhook';
+const WEBHOOK_URL = `${SERVER_URL.replace(/\/$/, '')}${WEBHOOK_PATH}`;
+
+// Telegram sends updates here (incl. /start)
+app.post(WEBHOOK_PATH, (req, res) => {
+    try { bot.processUpdate(req.body); } catch (e) { console.error('❌ processUpdate error:', e); }
+    res.sendStatus(200);
+});
 
 // --- БД ---
 const initDB = async () => {
@@ -1024,4 +1040,51 @@ app.post('/api/order', async (req, res) => {
 });
 
 
-app.listen(PORT, () => { console.log(`Server running on port ${PORT}`); });
+app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+    ensureTelegramWebhook();
+});
+
+async function ensureTelegramWebhook() {
+    if (!process.env.BOT_TOKEN) return;
+
+    // Telegram requires HTTPS for webhooks.
+    if (!SERVER_URL || !/^https:\/\//i.test(SERVER_URL)) {
+        console.warn('⚠️ SERVER_URL must be https to receive Telegram webhooks. Current:', SERVER_URL);
+        return;
+    }
+
+    try {
+        // If an old webhook/polling config exists, reset it (safe on fresh tokens too).
+        if (typeof bot.deleteWebHook === 'function') {
+            try { await bot.deleteWebHook({ drop_pending_updates: true }); } catch (_) {}
+        } else if (typeof bot.deleteWebhook === 'function') {
+            try { await bot.deleteWebhook({ drop_pending_updates: true }); } catch (_) {}
+        }
+
+        if (typeof bot.setWebHook === 'function') {
+            await bot.setWebHook(WEBHOOK_URL);
+        } else if (typeof bot.setWebhook === 'function') {
+            await bot.setWebhook(WEBHOOK_URL);
+        } else {
+            throw new Error('node-telegram-bot-api: setWebHook method not found');
+        }
+
+        console.log(`✅ Telegram webhook set: ${WEBHOOK_URL}`);
+
+        if (typeof bot.getWebHookInfo === 'function') {
+            try {
+                const info = await bot.getWebHookInfo();
+                console.log('ℹ️ Telegram getWebhookInfo:', info);
+            } catch (_) {}
+        } else if (typeof bot.getWebhookInfo === 'function') {
+            try {
+                const info = await bot.getWebhookInfo();
+                console.log('ℹ️ Telegram getWebhookInfo:', info);
+            } catch (_) {}
+        }
+    } catch (err) {
+        const data = err && err.response && err.response.data ? err.response.data : null;
+        console.error('❌ Telegram webhook setup failed:', data || err);
+    }
+}
